@@ -6,12 +6,90 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <assert.h>
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #include "hmac_md5.h"
 #include "md5.h"
 
 static unsigned port = 1812;
-static unsigned dump_eap_only = 1;
+static unsigned dump_eap_only = 0;
+
+static SSL_CTX *ssl_ctxt;
+
+#define BUF_LEN 4096
+#define MTU 1024
+
+struct udp_addr {
+  unsigned fd;
+  struct sockaddr caddr;
+
+  unsigned char req[BUF_LEN];
+  unsigned char rep[BUF_LEN];
+  unsigned reqlen;
+  unsigned replen;
+};
+
+struct eap_ctxt {
+  struct sockaddr peer_addr;
+  uint16_t mtu;
+  uint8_t rad_id;
+
+  /* Timeouts */
+
+  /* Radius-State */
+  unsigned char radius_state[4];
+
+  /* State:
+     0: unused
+     1: init tls sent (protocol, list of protocol)
+     2: in TLS handshake
+  */
+  enum eap_state { S_FREE, S_INIT, S_HANDSHAKE, S_TUNNEL } state;
+
+  /* TLS encapsulation
+     - buffer
+     - length
+
+     Input and Output BIOs.
+  */
+  uint32_t total_len;
+  uint32_t last_len;
+  uint32_t cur_len;
+  uint8_t last_id;
+  uint8_t rx_tx;
+
+  /* Input and Output BIOs for encapsulation.  */
+  BIO *mem_rd;  /* Data read from client.  */
+  BIO *mem_wr;  /* Data to be sent to client.  */
+  SSL *ssl;
+};
+
+#define NBR_EAP_CTXTS 8
+static struct eap_ctxt eap_ctxts[NBR_EAP_CTXTS];
+
+static uint16_t
+read16 (unsigned char *p)
+{
+  return (p[0] << 8) | p[1];
+}
+
+static uint32_t
+read32 (unsigned char *p)
+{
+  return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+}
+
+static void
+write32 (unsigned char *p, uint32_t v)
+{
+  p[0] = v >> 24;
+  p[1] = v >> 16;
+  p[2] = v >> 8;
+  p[3] = v >> 0;
+}
 
 /* Radius: RFC 2865
    https://www.rfc-editor.org/rfc/rfc2865
@@ -101,8 +179,25 @@ static unsigned dump_eap_only = 1;
 #define EAP_TYPE_PEAPv0 33
 #define EAP_TYPE_PWD 52  /* RFC 5931 */
 
+#define PEAP_FLAG_MASK  0xe0
+#define PEAP_FLAG_START 0x20
+#define PEAP_FLAG_MORE  0x40
+#define PEAP_FLAG_LEN   0x80
+
 static unsigned char key[] = "pass";
 static unsigned key_len = sizeof(key) - 1;
+
+static void
+dump_hex (const char *pfx, const unsigned char *p, unsigned len)
+{
+  unsigned i, j;
+  for (i = 0; i < len; i += 16) {
+    printf ("%s%04x:", pfx, i);
+    for (j = i; j < len && j < i + 16; j++)
+      printf (" %02x", p[j]);
+    putchar('\n');
+  }
+}
 
 static const char *
 disp_tls_content_type (unsigned c)
@@ -145,11 +240,11 @@ dump_peap (const unsigned char *p, unsigned plen)
 
   hlen = 1;
   printf ("   flags: %02x", p[0]);
-  if (p[0] & 0x80)
+  if (p[0] & PEAP_FLAG_LEN)
     printf (" Len");
-  if (p[0] & 0x40)
+  if (p[0] & PEAP_FLAG_MORE)
     printf (" MoreFrag");
-  if (p[0] & 0x20)
+  if (p[0] & PEAP_FLAG_START)
     printf (" PEAP-Start");
   if (p[0] & 0x18)
     printf (" MBZ-Err");
@@ -193,6 +288,18 @@ disp_eap_type (unsigned char typ)
   default:
     return "??";
   }
+}
+
+static void
+dump_eap_request(const unsigned char *p, unsigned plen)
+{
+  printf ("  type: %u  %s\n", p[0], disp_eap_type(p[0]));
+}
+
+static void
+dump_eap_response(const unsigned char *p, unsigned plen)
+{
+  printf ("  type: %u  %s\n", p[0], disp_eap_type(p[0]));
 }
 
 static void
@@ -589,27 +696,86 @@ compute_eap_authenticator (unsigned char *rep, unsigned int len)
   return compute_eap_authenticator_noalloc(rep, r - rep, p_mac);
 }
 
+static void
+app_radius_hdr (unsigned char *rep, unsigned *off,
+		unsigned char code, unsigned char id,
+		unsigned char *reqauth)
+{
+  /* Header.  */
+  rep[0] = code;
+  rep[1] = id;
+  rep[2] = 0;
+  rep[3] = 0;
+
+  /* Authenticator: copy RequestAuth.  */
+  memcpy(rep + 4, reqauth, 16);
+
+  *off = 20;
+}
+
+static void
+app_radius_attr(unsigned char *rep, unsigned *off,
+		unsigned char code, unsigned char *buf, unsigned len)
+{
+  unsigned l = *off;
+  assert(l + len < BUF_LEN);
+  assert(len <= 253);
+  rep[l++] = code;
+  rep[l++] = len + 2;
+  memcpy(rep + l, buf, len);
+  *off = l + len;
+}
+
+static void
+app_radius_eap(unsigned char *rep, unsigned *off,
+	       unsigned char *buf, unsigned len)
+{
+  buf[2] = len >> 8;
+  buf[3] = len & 0x0f;
+
+  while (len > 0) {
+    unsigned l = len > 253 ? 253 : len;
+    app_radius_attr(rep, off, ATTR_EAP_MESSAGE, buf, l);
+    len -= l;
+    buf += l;
+  }
+}
+
+static void
+app_radius_peap(unsigned char *rep, unsigned *off,
+		unsigned char *hdr, unsigned hlen,
+		unsigned char *buf, unsigned len)
+{
+  hdr[2] = (hlen + len) >> 8;
+  hdr[3] = (hlen + len) >> 0;
+
+  /* TODO: concat.  */
+  app_radius_attr(rep, off, ATTR_EAP_MESSAGE, hdr, hlen);
+
+  while (len > 0) {
+    unsigned l = len > 253 ? 253 : len;
+    app_radius_attr(rep, off, ATTR_EAP_MESSAGE, buf, l);
+    len -= l;
+    buf += l;
+  }
+}
+
 static int
 do_eap_challenge(unsigned char *req, int rea_len,
 		 unsigned char *eap, int eap_len,
 		 unsigned char *rep)
 {
+  unsigned off;
   unsigned char *r;
   unsigned len;
   unsigned char *p_mac;
 
   /* Header.  */
-  rep[0] = CODE_ACCESS_CHALLENGE;
-  rep[1] = req[1];
-  rep[2] = 0;
-  rep[3] = 0;
-
-  /* Authenticator: copy RequestAuth.  */
-  memcpy(rep + 4, req + 4, 16);
+  app_radius_hdr(rep, &off, CODE_ACCESS_CHALLENGE, req[1], req + 4);
 
   /* What do we put ?
      Copy proxy, create state... */
-  r = rep + 20;
+  r = rep + off;
 
   r[0] = ATTR_EAP_MESSAGE;
   r[1] = 0;
@@ -631,7 +797,7 @@ do_eap_challenge(unsigned char *req, int rea_len,
   }
   else if (1) {
     r[6] = EAP_TYPE_PEAP;
-    r[7] = 0x20; /* start */
+    r[7] = PEAP_FLAG_START;
     r[5] = 4 + 2;
   }
   else if (0) {
@@ -715,11 +881,321 @@ do_eap_auth(unsigned char *req, int rea_len,
 }
 
 static int
-handle_eap_message(unsigned char *p, int plen, unsigned eap_off,
-		   unsigned char *rep)
+do_eap_init(struct udp_addr *pkt,
+	    unsigned char *req, unsigned reqlen)
 {
-  unsigned char *eap = p + eap_off + 2;
-  unsigned eap_len = p[eap_off + 1];
+  struct eap_ctxt *ctxt;
+  unsigned char rsp[6];
+  unsigned off;
+  unsigned i;
+
+  /* Find a free context.  */
+  ctxt = NULL;
+  for (i = 0; i < NBR_EAP_CTXTS; i++)
+    if (eap_ctxts[i].state == S_FREE) {
+      ctxt = &eap_ctxts[i];
+      ctxt->state = S_INIT;
+      ctxt->radius_state[0] = i;
+      break;
+    }
+  if (ctxt == NULL) {
+    printf ("No context available\n");
+    return -1;
+  }
+
+  /* Fill the context. */
+  memcpy (&ctxt->peer_addr, &pkt->caddr, pkt->caddr.sa_len);
+  ctxt->rad_id = pkt->req[1];
+  ctxt->last_id = req[1] + 1;
+
+  /* Prepare the response.  */
+  app_radius_hdr(pkt->rep, &off,
+		 CODE_ACCESS_CHALLENGE, ctxt->rad_id, pkt->req + 4);
+
+  rsp[0] = EAP_CODE_REQUEST;
+  rsp[1] = ctxt->last_id;  /* id */
+  rsp[2] = 0;       /* len */
+  rsp[3] = 0;
+  rsp[4] = EAP_TYPE_PEAP;
+  rsp[5] = PEAP_FLAG_START;
+  app_radius_eap(pkt->rep, &off, rsp, 6);
+
+  app_radius_attr(pkt->rep, &off,
+		  ATTR_STATE, ctxt->radius_state, sizeof ctxt->radius_state);
+
+  return compute_eap_authenticator(pkt->rep, off);
+}
+
+static void
+BIO_discard(BIO *bio, unsigned len)
+{
+  char buf[1024];
+
+  while (len > 0) {
+    unsigned l = len > sizeof buf ? sizeof buf : len;
+    BIO_read(bio, buf, l);
+    len -= l;
+  }
+}
+
+static int
+do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
+	    unsigned char *req, unsigned reqlen)
+{
+  int res;
+  unsigned char eap_id;
+  unsigned char pflags;
+
+  /* Ok, we have something for TLS.  */
+  if (s->state == S_INIT) {
+    s->mem_rd = BIO_new(BIO_s_mem());
+    s->mem_wr = BIO_new(BIO_s_mem());
+    s->ssl = SSL_new(ssl_ctxt);
+    SSL_set_bio(s->ssl, s->mem_rd, s->mem_wr);
+    s->state = S_HANDSHAKE;
+    s->rx_tx = 1;
+    s->cur_len = 0;
+    s->last_len = 0;
+    s->total_len = 0;
+  }
+
+  /* Inspect packet.  */
+  assert(req[0] == EAP_CODE_RESPONSE);
+  assert(req[4] == EAP_TYPE_PEAP);
+  s->rad_id = pkt->req[1];
+  eap_id = req[1];
+  pflags = req[5];
+
+  if (pflags & PEAP_FLAG_START) {
+    printf ("Unexpected start\n");
+    return -1;
+  }
+  if ((pflags & PEAP_FLAG_MASK) == 0 && reqlen == 6) {
+    /* An ACK.  */
+    unsigned char *b;
+    long len;
+    unsigned off;
+    unsigned char rsp[6];
+
+    if (s->rx_tx != 1) {
+      /* Was not transmitting, or packet fully transmitted.  */
+      printf ("Unexpected ACK\n");
+      return -1;
+    }
+    if (s->last_id != eap_id) {
+      printf ("ACK for an unknown packet\n");
+      return -1;
+    }
+    /* ACK.  Discard bytes, send the next packet.  */
+    BIO_discard(s->mem_wr, s->last_len);
+    s->cur_len += s->last_len;
+
+    len = BIO_get_mem_data(s->mem_wr, (char **)&b);
+    printf ("### ack - total: %u, cur: %u, rem: %u, bio len: %u\n",
+	    s->total_len, s->cur_len, s->total_len - s->cur_len,
+	    (unsigned)len);
+    if (len == 0) {
+      assert (s->cur_len == s->total_len);
+    }
+    else {
+      s->last_id = eap_id + 1;
+      if (len > MTU)
+	len = MTU;
+      s->last_len = len;
+
+      app_radius_hdr(pkt->rep, &off,
+		     CODE_ACCESS_CHALLENGE, s->rad_id, pkt->req + 4);
+
+      rsp[0] = EAP_CODE_REQUEST;
+      rsp[1] = s->last_id;
+      rsp[2] = 0;       /* len */
+      rsp[3] = 0;
+      rsp[4] = EAP_TYPE_PEAP;
+      rsp[5] = s->cur_len + len < s->total_len ? PEAP_FLAG_MORE : 0;
+      app_radius_peap(pkt->rep, &off, rsp, sizeof rsp, b, len);
+
+      app_radius_attr(pkt->rep, &off, ATTR_STATE,
+		      s->radius_state, sizeof s->radius_state);
+
+      return compute_eap_authenticator(pkt->rep, off);
+    }
+  }
+  else {
+    /* 3 possibilities:
+       - Either a new packet (with flag LEN)
+       - Either a new packet (without flag LEN if the packet is small enough)
+       - Or a new fragment (with or without the MORE flag)
+    */
+    if (s->rx_tx != 1) {
+      printf ("Unexpected data - need to transmit\n");
+      return -1;
+    }
+    /* TODO: retransmission of the last packet. */
+    BIO_discard(s->mem_wr, s->last_len);
+
+    if (s->cur_len + s->last_len == s->total_len) {
+      /* This must be a new packet.  */
+      s->rx_tx = 0;
+      s->cur_len = 0;
+      s->last_id = eap_id;
+      if (pflags & PEAP_FLAG_LEN) {
+	/* A new packet with LEN */
+	s->total_len = read32(req + 6);
+	s->last_len = reqlen - 10;
+
+	req += 10;
+	reqlen -= 10;
+      }
+      else {
+	/* A new packet without LEN */
+	s->last_len = reqlen - 6;
+	s->total_len = s->last_len;
+	req += 6;
+	reqlen -= 6;
+      }
+    }
+    else {
+      /* A fragment  */
+      if (pflags & PEAP_FLAG_LEN) {
+	printf ("PEAP: unexpected LEN flag\n");
+	return -1;
+      }
+      req += 6;
+      reqlen -= 6;
+    }
+
+    if (BIO_write(s->mem_rd, req, reqlen) != reqlen) {
+      printf ("BIO_write error\n");
+      return -1;
+    }
+
+    assert(s->rx_tx == 0);
+    if (s->cur_len + s->last_len < s->total_len) {
+      printf ("TODO: need to send ACK\n");
+      return -1;
+    }
+  }
+
+  if (s->state == S_HANDSHAKE) {
+    res = SSL_accept(s->ssl);
+    if (res == 1) {
+      printf ("Handshake accepted\n");
+      s->state = S_TUNNEL;
+
+      /* Send EAP req id */
+      unsigned char req[5];
+      req[0] = EAP_CODE_REQUEST;
+      req[1] = 1;
+      req[2] = 0;
+      req[3] = 5;
+      req[4] = EAP_TYPE_IDENTITY;
+      printf ("#SSL send eap:\n");
+      dump_hex (" ", req, sizeof req);
+      dump_eap_message(req, sizeof req);
+      SSL_write (s->ssl, req, sizeof req);
+    }
+    else if (res == 0) {
+      printf ("Handshake failure\n");
+      return -1;
+    }
+  }
+  else if (s->state == S_TUNNEL) {
+    int len;
+
+    len = SSL_read(s->ssl, pkt->rep, sizeof pkt->rep);
+    if (len < 0) {
+      printf ("SSL read error\n");
+      return -1;
+    }
+    else {
+      printf ("##SSL recv eap:\n");
+      dump_hex ("  ", pkt->rep, len);
+      dump_eap_response(pkt->rep, len);
+
+      if (pkt->rep[0] == EAP_TYPE_IDENTITY) {
+#if 0
+	unsigned char rsp[20];
+	rsp[0] = EAP_CODE_REQUEST;
+	rsp[1] = 2;  /* id */
+	rsp[2] = 0;       /* len */
+	rsp[3] = 0;
+	rsp[4] = EAP_TYPE_MD5_CHALLENGE;
+	rsp[5] = 8;  /* value size */
+	memcpy (rsp + 5, "\x12\x34\x56\x78\x9a\xbc\xde\xf0", 8);  /* value */
+	memcpy (rsp + 5 + 8, "MRname", 6);
+	rsp[3] = 4 + 2 + 8 + 6;
+#else
+	unsigned char rsp[16];
+	rsp[0] = EAP_TYPE_MD5_CHALLENGE;
+	rsp[1] = 8;  /* value size */
+	memcpy (rsp + 2, "\x12\x34\x56\x78\x9a\xbc\xde\xf0", 8);  /* value */
+	memcpy (rsp + 2 + 8, "MRname", 6);
+#endif
+	printf ("SSL send md5 challenge\n");
+	dump_eap_response(rsp, sizeof rsp);
+	SSL_write (s->ssl, rsp, sizeof rsp);
+      }
+      else if (pkt->rep[0] == EAP_TYPE_MD5_CHALLENGE) {
+      }
+      else {
+	printf ("Unhandled PEAP req in TLS\n");
+	return -1;
+      }
+    }
+  }
+  else {
+    printf ("Unhandled SSL state\n");
+    return -1;
+  }
+
+  {
+    unsigned char *b;
+    long len;
+
+    len = BIO_get_mem_data(s->mem_wr, (char **)&b);
+    printf("BIO get_mem_data: %u\n", (unsigned)len);
+    if (len != 0) {
+      unsigned off;
+      unsigned char rsp[10];
+
+      s->rx_tx = 1;
+      s->total_len = len;
+      s->cur_len = 0;
+      s->last_id = eap_id + 1;
+      if (len > MTU)
+	len = MTU;
+      s->last_len = len;
+
+      /* Prepare the response.  */
+      app_radius_hdr(pkt->rep, &off,
+		     CODE_ACCESS_CHALLENGE, s->rad_id, pkt->req + 4);
+
+      rsp[0] = EAP_CODE_REQUEST;
+      rsp[1] = s->last_id;
+      rsp[2] = 0;       /* len */
+      rsp[3] = 0;
+      rsp[4] = EAP_TYPE_PEAP;
+      rsp[5] = PEAP_FLAG_LEN | (len < s->total_len ? PEAP_FLAG_MORE : 0);
+      write32(rsp + 6, s->total_len);
+      app_radius_peap(pkt->rep, &off, rsp, sizeof rsp, b, len);
+
+      app_radius_attr(pkt->rep, &off, ATTR_STATE,
+		      s->radius_state, sizeof s->radius_state);
+
+      return compute_eap_authenticator(pkt->rep, off);
+    }
+    printf ("SSL wants to read after rx!\n");
+    return -1;
+  }
+  printf ("Unhandled peap\n");
+  return -1;
+}
+
+static int
+handle_eap_message(struct udp_addr *pkt, unsigned char *state,
+		   unsigned char *eap, unsigned eap_len)
+{
+  struct eap_ctxt *ctxt;
 
   /* Sanity check.  */
   if (eap_len < 4) {
@@ -727,12 +1203,28 @@ handle_eap_message(unsigned char *p, int plen, unsigned eap_off,
     return -1;
   }
 
-  /* Length of the EAP-Message string.  */
-  eap_len -= 2;
-
-  if (((eap[2] << 8) | eap[3]) != eap_len) {
+  if (read16(eap + 2) != eap_len) {
     printf ("Bad EAP-Message length field\n");
     return -1;
+  }
+
+  /* Find the context.  */
+  ctxt = NULL;
+  if (state != NULL) {
+    unsigned i;
+    for (i = 0; i < NBR_EAP_CTXTS; i++) {
+      ctxt = &eap_ctxts[i];
+      if (ctxt->state != S_FREE
+	  && state[1] - 2 == sizeof (ctxt->radius_state)
+	  && memcmp (state + 2,
+		     ctxt->radius_state, sizeof ctxt->radius_state) == 0)
+	break;
+      ctxt = NULL;
+    }
+    if (ctxt == NULL) {
+      printf ("State present but not found\n");
+      return -1;
+    }
   }
 
   if (eap[0] == EAP_CODE_RESPONSE) {
@@ -743,9 +1235,20 @@ handle_eap_message(unsigned char *p, int plen, unsigned eap_off,
     case EAP_TYPE_IDENTITY:
       /* This is the first message: the identity has been transmitted,
 	 time to challenge.  */
-      return do_eap_challenge(p, plen, eap, eap_len, rep);
+      /* Create a context:
+	 - ip+port, random, number
+	 - extract user
+	 - extract MTU
+	 - extract calling station id, called station id...
+      */
+      if (1)
+	return do_eap_init(pkt, eap, eap_len);
+      else
+	return do_eap_challenge(pkt->req, pkt->reqlen, eap, eap_len, pkt->rep);
+    case EAP_TYPE_PEAP:
+      return do_eap_peap(pkt, ctxt, eap, eap_len);
     case EAP_TYPE_MD5_CHALLENGE:
-      return do_eap_auth(p, plen, eap, eap_len, rep);
+      return do_eap_auth(pkt->req, pkt->reqlen, eap, eap_len, pkt->rep);
     default:
       printf ("Unhandled eap response type (%u)\n", eap[4]);
       break;
@@ -759,12 +1262,15 @@ handle_eap_message(unsigned char *p, int plen, unsigned eap_off,
 }
 
 static int
-handle_access_request(unsigned char *p, int plen, unsigned char *rep)
+handle_access_request(struct udp_addr *pkt)
 {
+  unsigned char eap_buf[4096];
+  unsigned eap_len = 0;
+  unsigned char *state;
   int auth;
   unsigned off;
 
-  auth = auth_request(p, plen);
+  auth = auth_request(pkt->req, pkt->reqlen);
   if (auth < 0) {
     printf ("Authentification failed\n");
     return -1;
@@ -774,18 +1280,64 @@ handle_access_request(unsigned char *p, int plen, unsigned char *rep)
     return -1;
   }
 
-  /* Find EAP-Message.
-     TODO: gather EAP-Message attributes.  */
-  for (off = 20; off < plen; ) {
-    if (p[off] == ATTR_EAP_MESSAGE) {
-      return handle_eap_message(p, plen, off, rep);
+  /* Find and gather EAP-Message, find State.  */
+  eap_len = 0;
+  state = NULL;
+  for (off = 20; off < pkt->reqlen; ) {
+    unsigned alen = pkt->req[off + 1];
+
+    if (pkt->req[off] == ATTR_EAP_MESSAGE) {
+      memcpy (eap_buf + eap_len, pkt->req + off + 2, alen - 2);
+      eap_len += alen - 2;
     }
-    off += p[off + 1];
+    else if (pkt->req[off] == ATTR_STATE)
+      state = pkt->req + off;
+    off += pkt->req[off + 1];
+  }
+  if (eap_len != 0) {
+    printf ("EAP message(2) len=%u:\n", eap_len);
+    dump_eap_message(eap_buf, eap_len);
+    return handle_eap_message(pkt, state, eap_buf, eap_len);
+  }
+  else {
+    /* TODO: handle non EAP.  */
+    printf ("Not handled: non-EAP request\n");
+    return -1;
+  }
+}
+
+static SSL_CTX *
+init_openssl(void)
+{
+  const SSL_METHOD *method;
+  SSL_CTX *ctx;
+
+  SSL_load_error_strings();
+  OpenSSL_add_ssl_algorithms();
+
+  method = SSLv23_server_method();
+
+  ctx = SSL_CTX_new(method);
+  if (!ctx) {
+    perror("Unable to create SSL context");
+    ERR_print_errors_fp(stderr);
+    exit(EXIT_FAILURE);
   }
 
-  /* TODO: handle non EAP.  */
-  printf ("Not handled: non-EAP request\n");
-  return -1;
+  SSL_CTX_set_ecdh_auto(ctx, 1);
+
+  /* Set the key and cert */
+  if (SSL_CTX_use_certificate_file(ctx, "cert.pem", SSL_FILETYPE_PEM) <= 0) {
+    ERR_print_errors_fp(stderr);
+    exit(EXIT_FAILURE);
+  }
+
+  if (SSL_CTX_use_PrivateKey_file(ctx, "key.pem", SSL_FILETYPE_PEM) <= 0 ) {
+    ERR_print_errors_fp(stderr);
+    exit(EXIT_FAILURE);
+  }
+
+  return ctx;
 }
 
 static int
@@ -794,6 +1346,8 @@ server(void)
   int sock;
   struct sockaddr_in myaddr;
   int bin_log;
+
+  ssl_ctxt = init_openssl();
 
   sock = socket (PF_INET, SOCK_DGRAM, 0);
   if (sock < 0) {
@@ -816,15 +1370,15 @@ server(void)
     perror("cannot open log file");
 
   while (1) {
-    struct sockaddr_in addr;
-    unsigned char req[4096];
-    unsigned char rep[4096];
-    socklen_t alen = sizeof(addr);
-    unsigned plen;
+    struct udp_addr uaddr;
+    socklen_t alen;
     int res;
     int r;
 
-    r = recvfrom(sock, req, sizeof req, 0, (struct sockaddr *)&addr, &alen);
+    uaddr.fd = sock;
+    alen = sizeof(uaddr.caddr);
+
+    r = recvfrom(sock, uaddr.req, sizeof uaddr.req, 0, &uaddr.caddr, &alen);
     if (r < 0) {
       if (errno == EAGAIN)
 	continue;
@@ -832,26 +1386,27 @@ server(void)
       return 1;
     }
 
-    if (alen >= sizeof(addr) && addr.sin_family == AF_INET) {
+    if (uaddr.caddr.sa_family == AF_INET) {
+      struct sockaddr_in *sin = (struct sockaddr_in *)&uaddr.caddr;
       printf ("### from: %s port %u, len: %u\n",
-	      inet_ntoa(addr.sin_addr), ntohs(addr.sin_port), r);
+	      inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), r);
     }
-    dump_radius(req, r);
+    dump_radius(uaddr.req, r);
 
     /* Discard invalid packets.  */
     if (r < 20 || r > 4096)
       continue;
-    plen = (req[2] << 8) | req[3];
-    if (plen < 20 || plen > r)
+    uaddr.reqlen = read16(uaddr.req + 2);
+    if (uaddr.reqlen < 20 || uaddr.reqlen > r)
       continue;
 
     if (bin_log >= 0)
-      write(bin_log, req, plen);
+      write(bin_log, uaddr.req, uaddr.reqlen);
 
     /* TODO: check attributes (length)  */
 
-    if (req[0] == CODE_ACCESS_REQUEST)
-      res = handle_access_request(req, plen, rep);
+    if (uaddr.req[0] == CODE_ACCESS_REQUEST)
+      res = handle_access_request(&uaddr);
     else {
       printf ("unhandled\n");
       continue;
@@ -860,15 +1415,16 @@ server(void)
     if (res <= 0)
       continue;
 
-    if (alen >= sizeof(addr) && addr.sin_family == AF_INET) {
+    if (uaddr.caddr.sa_family == AF_INET) {
+      struct sockaddr_in *sin = (struct sockaddr_in *)&uaddr.caddr;
       printf ("### to: %s port %u, len: %u\n",
-	      inet_ntoa(addr.sin_addr), ntohs(addr.sin_port), res);
+	      inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), res);
     }
-    dump_radius(rep, res);
+    dump_radius(uaddr.rep, res);
     if (bin_log >= 0)
-      write(bin_log, rep, res);
+      write(bin_log, uaddr.rep, res);
 
-    r = sendto (sock, rep, res, 0, (struct sockaddr *)&addr, alen);
+    r = sendto (sock, uaddr.rep, res, 0, &uaddr.caddr, uaddr.caddr.sa_len);
     if (r != res)
       perror ("sendto");
   }
@@ -878,7 +1434,6 @@ static int
 test_server(void)
 {
   unsigned char buf[4096];
-  unsigned char rep[4096];
   int len;
   int res;
 
@@ -898,17 +1453,6 @@ test_server(void)
 
     printf ("## Read %u bytes ########\n", len);
     dump_radius(buf, len);
-
-    if (buf[0] == CODE_ACCESS_REQUEST)
-      res = handle_access_request(buf, len, rep);
-    else
-      res = 0;
-
-    if (res > 0) {
-      printf ("## Write %u bytes ########\n", res);
-      dump_radius(rep, res);
-      //    write(1, rep, res);
-    }
   }
 
   return 0;
@@ -1008,13 +1552,29 @@ dump_pcap(void)
 int
 main (int argc, char *argv[])
 {
-  if (argc == 2 && strcmp(argv[1], "-") == 0)
-    return test_server();
-  else if (argc == 2 && strcmp(argv[1], "-r") == 0)
+  unsigned flag_dump = 0;
+
+  /* Skip progname. */
+  argv++;
+  argc--;
+
+  while (argc > 0) {
+    if (strcmp (argv[0], "-de") == 0)
+      dump_eap_only = 1;
+    else if (strcmp (argv[0], "-r") == 0)
+      flag_dump = 1;
+    else if (strcmp(argv[0], "-") == 0)
+      return test_server();
+    else {
+      fprintf (stderr, "unknown option %s\n", argv[0]);
+      return 2;
+    }
+    argv++;
+    argc--;
+  }
+
+  if (flag_dump)
     return dump_pcap();
   else
     return server();
 }
-
-
-// ZhAXDptRAUGNPa86ZhZL3Jjdz1lDXay031fHddv17vz0Tw3P40tqQDFNsnYy8Lr
