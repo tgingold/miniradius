@@ -71,13 +71,13 @@ struct eap_ctxt {
 static struct eap_ctxt eap_ctxts[NBR_EAP_CTXTS];
 
 static uint16_t
-read16 (unsigned char *p)
+read16 (const unsigned char *p)
 {
   return (p[0] << 8) | p[1];
 }
 
 static uint32_t
-read32 (unsigned char *p)
+read32 (const unsigned char *p)
 {
   return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
 }
@@ -176,7 +176,7 @@ write32 (unsigned char *p, uint32_t v)
 #define EAP_TYPE_EAP_TLS 13
 #define EAP_TYPE_EAP_TTLS 0x15
 #define EAP_TYPE_PEAP 0x19
-#define EAP_TYPE_PEAPv0 33
+#define EAP_TYPE_PEAP_EXTENSION 33
 #define EAP_TYPE_PWD 52  /* RFC 5931 */
 
 #define PEAP_FLAG_MASK  0xe0
@@ -281,8 +281,8 @@ disp_eap_type (unsigned char typ)
     return "EAP-TTLS";
   case EAP_TYPE_PEAP:
     return "PEAP";
-  case EAP_TYPE_PEAPv0:
-    return "PEAPv0";
+  case EAP_TYPE_PEAP_EXTENSION:
+    return "PEAP extension";
   case EAP_TYPE_PWD:
     return "pwd";
   default:
@@ -315,6 +315,12 @@ dump_eap_message (const unsigned char *p, unsigned plen)
   case EAP_CODE_RESPONSE:
     printf ("Response");
     break;
+  case EAP_CODE_SUCCESS:
+    printf ("Success");
+    break;
+  case EAP_CODE_FAILURE:
+    printf ("Failure");
+    break;
   }
   if (len != plen) {
     putchar ('\n');
@@ -343,6 +349,21 @@ dump_eap_message (const unsigned char *p, unsigned plen)
 	    printf ("  %02x (%s)", p[i], disp_eap_type(p[i]));
 	  putchar('\n');
 	}
+	break;
+      case EAP_TYPE_PEAP_EXTENSION:
+	if (len < 9) {
+	  printf ("  Incorrect length\n");
+	  break;
+	}
+	else {
+	  unsigned avp_len = read16(p + 7);
+	  printf ("   AVP type: %04x, len: %u\n", read16(p + 5), avp_len);
+	  if (avp_len != len - 9)
+	    printf ("   Bad AVP length\n");
+	  else
+	    dump_hex ("   ", p + 9, avp_len);
+	}
+	break;
       }
     }
     break;
@@ -916,7 +937,7 @@ do_eap_init(struct udp_addr *pkt,
   rsp[1] = ctxt->last_id;  /* id */
   rsp[2] = 0;       /* len */
   rsp[3] = 0;
-  rsp[4] = EAP_TYPE_PEAP;
+  rsp[4] = EAP_TYPE_PEAP; // EAP_TTLS;
   rsp[5] = PEAP_FLAG_START;
   app_radius_eap(pkt->rep, &off, rsp, 6);
 
@@ -961,7 +982,6 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 
   /* Inspect packet.  */
   assert(req[0] == EAP_CODE_RESPONSE);
-  assert(req[4] == EAP_TYPE_PEAP);
   s->rad_id = pkt->req[1];
   eap_id = req[1];
   pflags = req[5];
@@ -1083,6 +1103,7 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       s->state = S_TUNNEL;
 
       /* Send EAP req id */
+#if 1
       unsigned char req[5];
       req[0] = EAP_CODE_REQUEST;
       req[1] = 1;
@@ -1092,6 +1113,13 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       printf ("#SSL send eap:\n");
       dump_hex (" ", req, sizeof req);
       dump_eap_message(req, sizeof req);
+#else
+      unsigned char req[1];
+      req[0] = EAP_TYPE_IDENTITY;
+      printf ("#SSL send eap:\n");
+      dump_hex (" ", req, sizeof req);
+      dump_eap_request(req, sizeof req);
+#endif
       SSL_write (s->ssl, req, sizeof req);
     }
     else if (res == 0) {
@@ -1136,6 +1164,45 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	SSL_write (s->ssl, rsp, sizeof rsp);
       }
       else if (pkt->rep[0] == EAP_TYPE_MD5_CHALLENGE) {
+	/* Success.  */
+	unsigned char rsp[11];
+	rsp[0] = EAP_CODE_REQUEST;
+	rsp[1] = 6;  /* id */
+	rsp[2] = 0;       /* len */
+	rsp[3] = 0;
+	rsp[4] = EAP_TYPE_PEAP_EXTENSION;
+	rsp[5] = 0x80; /* Mandatory AVP */
+	rsp[6] = 0x03; /* Result */
+	rsp[7] = 0;    /* Length */
+	rsp[8] = 2;
+	rsp[9] = 0;  /* Success */
+	rsp[10] = 1;
+	rsp[3] = sizeof rsp;
+	printf ("SSL send result\n");
+	dump_eap_message(rsp, sizeof rsp);
+	SSL_write (s->ssl, rsp, sizeof rsp);
+      }
+      else if (pkt->rep[0] == EAP_CODE_RESPONSE
+	       && len == 11
+	       && pkt->rep[1] == 6 /* id */
+	       && read16(pkt->rep + 2) == 11 /* len */
+	       && pkt->rep[4] == EAP_TYPE_PEAP_EXTENSION
+	       && read16(pkt->rep + 5) == 0x8003
+	       && read16(pkt->rep + 7) == 2
+	       && read16(pkt->rep + 9) == 1) {
+	/* Send EAP-success */
+	unsigned char rsp[4];
+	unsigned off;
+	app_radius_hdr(pkt->rep, &off,
+		       CODE_ACCESS_ACCEPT, s->rad_id, pkt->req + 4);
+
+	rsp[0] = EAP_CODE_SUCCESS;
+	rsp[1] = s->last_id + 1;
+	rsp[2] = 0;       /* len */
+	rsp[3] = 4;
+	app_radius_eap(pkt->rep, &off, rsp, sizeof rsp);
+
+	return compute_eap_authenticator(pkt->rep, off);
       }
       else {
 	printf ("Unhandled PEAP req in TLS\n");
@@ -1246,6 +1313,7 @@ handle_eap_message(struct udp_addr *pkt, unsigned char *state,
       else
 	return do_eap_challenge(pkt->req, pkt->reqlen, eap, eap_len, pkt->rep);
     case EAP_TYPE_PEAP:
+    case EAP_TYPE_EAP_TTLS:
       return do_eap_peap(pkt, ctxt, eap, eap_len);
     case EAP_TYPE_MD5_CHALLENGE:
       return do_eap_auth(pkt->req, pkt->reqlen, eap, eap_len, pkt->rep);
@@ -1439,6 +1507,8 @@ test_server(void)
 
   while (1) {
     len = read(0, buf, 4);
+    if (len == 0)
+      return 0;
     if (len != 4) {
       perror ("read");
       return 1;
