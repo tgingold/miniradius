@@ -34,6 +34,8 @@
 #include "radius.h"
 #include "dump.h"
 
+static unsigned flag_dump = 0;
+
 unsigned port = 1812;
 
 static SSL_CTX *ssl_ctxt;
@@ -567,9 +569,10 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
     s->cur_len += s->last_len;
 
     len = BIO_get_mem_data(s->mem_wr, (char **)&b);
-    printf ("### ack - total: %u, cur: %u, rem: %u, bio len: %u\n",
-	    s->total_len, s->cur_len, s->total_len - s->cur_len,
-	    (unsigned)len);
+    if (flag_dump)
+      printf ("### ack - total: %u, cur: %u, rem: %u, bio len: %u\n",
+	      s->total_len, s->cur_len, s->total_len - s->cur_len,
+	      (unsigned)len);
     if (len == 0) {
       assert (s->cur_len == s->total_len);
     }
@@ -655,7 +658,8 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
   if (s->state == S_HANDSHAKE) {
     res = SSL_accept(s->ssl);
     if (res == 1) {
-      printf ("Handshake accepted\n");
+      if (0)
+	printf ("Handshake accepted\n");
       s->state = S_TUNNEL;
 
       /* Send EAP req id */
@@ -666,9 +670,11 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       req[2] = 0;
       req[3] = 5;
       req[4] = EAP_TYPE_IDENTITY;
-      printf ("#SSL send eap (init):\n");
-      dump_hex (" ", req, sizeof req);
-      dump_eap_message(req, sizeof req);
+      if (flag_dump) {
+	printf ("#SSL send eap (init):\n");
+	dump_hex (" ", req, sizeof req);
+	dump_eap_message(req, sizeof req);
+      }
 #else
       unsigned char req[1];
       req[0] = EAP_TYPE_IDENTITY;
@@ -693,9 +699,11 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       return -1;
     }
     else {
-      printf ("##SSL recv eap:\n");
-      dump_hex ("  ", pkt->rep, len);
-      dump_eap_response(pkt->rep, len);
+      if (flag_dump) {
+	printf ("##SSL recv eap:\n");
+	dump_hex ("  ", pkt->rep, len);
+	dump_eap_response(pkt->rep, len);
+      }
 
       if (pkt->rep[0] == EAP_TYPE_IDENTITY) {
 	/* Copy user name.
@@ -723,8 +731,10 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	memcpy (rsp + 2, "\x12\x34\x56\x78\x9a\xbc\xde\xf0", 8);  /* value */
 	memcpy (rsp + 2 + 8, "MRname", 6);
 #endif
-	printf ("SSL send md5 challenge\n");
-	dump_eap_response(rsp, sizeof rsp);
+	if (flag_dump) {
+	  printf ("SSL send md5 challenge\n");
+	  dump_eap_response(rsp, sizeof rsp);
+	}
 	SSL_write (s->ssl, rsp, sizeof rsp);
       }
       else if (pkt->rep[0] == EAP_TYPE_MD5_CHALLENGE) {
@@ -742,8 +752,10 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	rsp[9] = 0;  /* Success */
 	rsp[10] = 1;
 	rsp[3] = sizeof rsp;
-	printf ("SSL send result\n");
-	dump_eap_message(rsp, sizeof rsp);
+	if (flag_dump) {
+	  printf ("SSL send result\n");
+	  dump_eap_message(rsp, sizeof rsp);
+	}
 	SSL_write (s->ssl, rsp, sizeof rsp);
       }
       else if (pkt->rep[0] == EAP_CODE_RESPONSE
@@ -801,7 +813,8 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
     long len;
 
     len = BIO_get_mem_data(s->mem_wr, (char **)&b);
-    printf("BIO get_mem_data: %u\n", (unsigned)len);
+    if (0)
+      printf("BIO get_mem_data: %u\n", (unsigned)len);
     if (len != 0) {
       unsigned off;
       unsigned char rsp[10];
@@ -944,8 +957,10 @@ handle_access_request(struct udp_addr *pkt)
     off += pkt->req[off + 1];
   }
   if (eap_len != 0) {
-    printf ("EAP message(concat) len=%u:\n", eap_len);
-    dump_eap_message(eap_buf, eap_len);
+    if (flag_dump) {
+      printf ("EAP message(concat) len=%u:\n", eap_len);
+      dump_eap_message(eap_buf, eap_len);
+    }
     return handle_eap_message(pkt, state, eap_buf, eap_len);
   }
   else {
@@ -1042,12 +1057,14 @@ server(unsigned flag_write)
       return 1;
     }
 
-    if (uaddr.caddr.sa_family == AF_INET) {
-      struct sockaddr_in *sin = (struct sockaddr_in *)&uaddr.caddr;
-      printf ("### from: %s port %u, len: %u\n",
-	      inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), r);
+    if (flag_dump) {
+      if (uaddr.caddr.sa_family == AF_INET) {
+	struct sockaddr_in *sin = (struct sockaddr_in *)&uaddr.caddr;
+	printf ("### from: %s port %u, len: %u\n",
+		inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), r);
+      }
+      dump_radius(uaddr.req, r);
     }
-    dump_radius(uaddr.req, r);
 
     /* Discard invalid packets.  */
     if (r < 20 || r > 4096)
@@ -1071,12 +1088,15 @@ server(unsigned flag_write)
     if (res <= 0)
       continue;
 
-    if (uaddr.caddr.sa_family == AF_INET) {
-      struct sockaddr_in *sin = (struct sockaddr_in *)&uaddr.caddr;
-      printf ("### to: %s port %u, len: %u\n",
-	      inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), res);
+    if (flag_dump) {
+      if (uaddr.caddr.sa_family == AF_INET) {
+	struct sockaddr_in *sin = (struct sockaddr_in *)&uaddr.caddr;
+	printf ("### to: %s port %u, len: %u\n",
+		inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), res);
+      }
+      dump_radius(uaddr.rep, res);
     }
-    dump_radius(uaddr.rep, res);
+
     if (flag_write)
       write(bin_log, uaddr.rep, res);
 
@@ -1101,6 +1121,8 @@ main (int argc, char *argv[])
   while (argc > 0) {
     if (strcmp (argv[0], "-de") == 0)
       dump_eap_only = 1;
+    else if (strcmp (argv[0], "-d") == 0)
+      flag_dump = 1;
     else if (strcmp (argv[0], "-r") == 0)
       flag_dump_pcap = 1;
     else if (strcmp (argv[0], "-W") == 0)
