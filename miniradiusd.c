@@ -75,7 +75,15 @@ struct eap_ctxt {
      1: init tls sent (protocol, list of protocol)
      2: in TLS handshake
   */
-  enum eap_state { S_FREE, S_INIT, S_HANDSHAKE, S_TUNNEL } state;
+  enum eap_state {
+    S_FREE,
+    S_INIT,
+    S_HANDSHAKE,
+    S_TUN_SEND_IDENTITY,
+    S_TUN_RECV_IDENTITY,
+    S_TUN_RECV_CHALLENGE,
+    S_TUN_RECV_RESULT
+  } state;
 
   /* TLS encapsulation
      - buffer
@@ -410,18 +418,11 @@ BIO_discard(BIO *bio, unsigned len)
 }
 
 static int
-do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
-	    unsigned char *req, unsigned reqlen)
+do_eap_tun_in(struct udp_addr *pkt, struct eap_ctxt *s,
+	      unsigned char *req, unsigned reqlen)
 {
-  int res;
   unsigned char eap_id;
   unsigned char pflags;
-
-  /* Handle only PEAP.  */
-  if (req[4] != EAP_TYPE_PEAP) {
-    log_err ("Unhandled eap response type (%u)\n", req[4]);
-    return -1;
-  }
 
   /* Ok, we have something for TLS.  */
   if (s->state == S_INIT) {
@@ -554,201 +555,259 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
     }
   }
 
-  if (s->state == S_HANDSHAKE) {
-    res = SSL_accept(s->ssl);
-    if (res == 1) {
-      if (0)
-	printf ("Handshake accepted\n");
-      s->state = S_TUNNEL;
-
-      /* Send EAP req id */
-#if 1
-      unsigned char req[5];
-      req[0] = EAP_CODE_REQUEST;
-      req[1] = 1;
-      req[2] = 0;
-      req[3] = 5;
-      req[4] = EAP_TYPE_IDENTITY;
-      if (flag_dump) {
-	printf ("#SSL send eap (init):\n");
-	dump_hex (" ", req, sizeof req);
-	dump_eap_message(req, sizeof req);
-      }
-#else
-      unsigned char req[1];
-      req[0] = EAP_TYPE_IDENTITY;
-      printf ("#SSL send eap (init):\n");
-      dump_hex (" ", req, sizeof req);
-      dump_eap_request(req, sizeof req);
-#endif
-      SSL_write (s->ssl, req, sizeof req);
-    }
-    else if (res == 0) {
-      printf ("Handshake failure\n");
-      return -1;
-    }
+  if (flag_dump) {
+    unsigned char *b;
+    long len;
+    len = BIO_get_mem_data(s->mem_rd, (char **)&b);
+    printf ("TLS: recv %ld bytes\n", len);
+    dump_tls (b, len);
   }
-  else if (s->state == S_TUNNEL) {
-    int len;
+  return 0;
+}
 
+static int
+do_eap_tun_out(struct udp_addr *pkt, struct eap_ctxt *s,
+	       unsigned char *req)
+{
+  unsigned char *b;
+  long len;
+  unsigned eap_id = req[1];
+
+  len = BIO_get_mem_data(s->mem_wr, (char **)&b);
+
+  if (flag_dump) {
+    printf ("TLS: send %ld bytes\n", len);
+    dump_tls (b, len);
+  }
+
+  if (0)
+    printf("BIO get_mem_data: %u\n", (unsigned)len);
+  if (len != 0) {
+    unsigned off;
+    unsigned char rsp[10];
+
+    s->rx_tx = 1;
+    s->total_len = len;
+    s->cur_len = 0;
+    s->last_id = eap_id + 1;
+    if (len > MTU)
+      len = MTU;
+    s->last_len = len;
+
+    /* Prepare the response.  */
+    app_radius_hdr(pkt->rep, &off,
+		   CODE_ACCESS_CHALLENGE, s->rad_id, pkt->req + 4);
+
+    rsp[0] = EAP_CODE_REQUEST;
+    rsp[1] = s->last_id;
+    rsp[2] = 0;       /* len */
+    rsp[3] = 0;
+    rsp[4] = EAP_TYPE_PEAP;
+    rsp[5] = PEAP_FLAG_LEN | (len < s->total_len ? PEAP_FLAG_MORE : 0);
+    write32(rsp + 6, s->total_len);
+    app_radius_peap(pkt->rep, &off, rsp, sizeof rsp, b, len);
+
+    app_radius_attr(pkt->rep, &off, ATTR_STATE,
+		    s->radius_state, sizeof s->radius_state);
+
+    return compute_eap_authenticator(pkt->rep, off);
+  }
+  printf ("SSL wants to read after rx!\n");
+  return -1;
+}
+
+static void
+do_eap_peap_ident(struct eap_ctxt *s)
+{
+  /* Send EAP req id */
+  unsigned char req[5];
+  req[0] = EAP_CODE_REQUEST;
+  req[1] = 1;
+  req[2] = 0;
+  req[3] = 5;
+  req[4] = EAP_TYPE_IDENTITY;
+  if (flag_dump) {
+    printf ("#SSL send eap (identity):\n");
+    dump_hex (" ", req, sizeof req);
+    dump_eap_message(req, sizeof req);
+  }
+  SSL_write (s->ssl, req, sizeof req);
+}
+
+static int
+do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
+	    unsigned char *req, unsigned reqlen)
+{
+  int res;
+  int len;
+
+  /* Handle only PEAP.  */
+  if (req[4] != EAP_TYPE_PEAP) {
+    log_err ("Unhandled eap response type (%u)\n", req[4]);
+    return -1;
+  }
+
+  res = do_eap_tun_in(pkt, s, req, reqlen);
+  if (res != 0)
+    return res;
+
+  if (s->state != S_HANDSHAKE) {
     len = SSL_read(s->ssl, pkt->rep, sizeof pkt->rep);
     if (len < 0) {
-      printf ("SSL read error: len=%d, err=%d\n",
-	      len, SSL_get_error(s->ssl, len));
-      return -1;
-    }
-    else {
-      if (flag_dump) {
-	printf ("##SSL recv eap:\n");
-	dump_hex ("  ", pkt->rep, len);
-	dump_eap_response(pkt->rep, len);
-      }
-
-      if (pkt->rep[0] == EAP_TYPE_IDENTITY) {
-	/* Copy user name.
-	   TODO: check length.
-	 */
-	{
-	  s->user_name[0] = len - 1;
-	  memcpy(s->user_name + 1, pkt->rep + 1, len - 1);
-	}
-#if 0
-	unsigned char rsp[20];
-	rsp[0] = EAP_CODE_REQUEST;
-	rsp[1] = 2;  /* id */
-	rsp[2] = 0;       /* len */
-	rsp[3] = 0;
-	rsp[4] = EAP_TYPE_MD5_CHALLENGE;
-	rsp[5] = 8;  /* value size */
-	memcpy (rsp + 5, "\x12\x34\x56\x78\x9a\xbc\xde\xf0", 8);  /* value */
-	memcpy (rsp + 5 + 8, "MRname", 6);
-	rsp[3] = 4 + 2 + 8 + 6;
-#else
-	unsigned char rsp[16];
-	rsp[0] = EAP_TYPE_MD5_CHALLENGE;
-	rsp[1] = 8;  /* value size */
-	memcpy (rsp + 2, "\x12\x34\x56\x78\x9a\xbc\xde\xf0", 8);  /* value */
-	memcpy (rsp + 2 + 8, "MRname", 6);
-#endif
-	if (flag_dump) {
-	  printf ("SSL send md5 challenge\n");
-	  dump_eap_response(rsp, sizeof rsp);
-	}
-	SSL_write (s->ssl, rsp, sizeof rsp);
-      }
-      else if (pkt->rep[0] == EAP_TYPE_MD5_CHALLENGE) {
-	/* Success.  */
-	unsigned char rsp[11];
-	rsp[0] = EAP_CODE_REQUEST;
-	rsp[1] = 6;  /* id */
-	rsp[2] = 0;       /* len */
-	rsp[3] = 0;
-	rsp[4] = EAP_TYPE_PEAP_EXTENSION;
-	rsp[5] = 0x80; /* Mandatory AVP */
-	rsp[6] = 0x03; /* Result */
-	rsp[7] = 0;    /* Length */
-	rsp[8] = 2;
-	rsp[9] = 0;  /* Success */
-	rsp[10] = 1;
-	rsp[3] = sizeof rsp;
-	if (flag_dump) {
-	  printf ("SSL send result\n");
-	  dump_eap_message(rsp, sizeof rsp);
-	}
-	SSL_write (s->ssl, rsp, sizeof rsp);
-      }
-      else if (pkt->rep[0] == EAP_CODE_RESPONSE
-	       && len == 11
-	       && pkt->rep[1] == 6 /* id */
-	       && read16(pkt->rep + 2) == 11 /* len */
-	       && pkt->rep[4] == EAP_TYPE_PEAP_EXTENSION
-	       && read16(pkt->rep + 5) == 0x8003
-	       && read16(pkt->rep + 7) == 2
-	       && read16(pkt->rep + 9) == 1) {
-	/* Send EAP-success */
-	unsigned char rsp[4];
-	unsigned off;
-	/* Keying material.  */
-	unsigned char key_mat[128];
-	static char label[] = "client EAP encryption"; /* RFC 5216 2.3 */
-
-	app_radius_hdr(pkt->rep, &off,
-		       CODE_ACCESS_ACCEPT, s->rad_id, pkt->req + 4);
-	app_radius_attr(pkt->rep, &off,
-			ATTR_USER_NAME, s->user_name + 1, s->user_name[0]);
-
-	if (SSL_export_keying_material(s->ssl, key_mat, sizeof (key_mat),
-				       label, sizeof(label) - 1,
-				       NULL, 0, 0) != 1) {
-	  printf ("SSL_export keying error\n");
-	  return -1;
-	}
-
-	/* Encrypt recv and send keys.  RFC 2548 2.4.2 */
-	app_radius_mppe(pkt->rep, &off, 0x11, key_mat, pkt->req + 4);
-	app_radius_mppe(pkt->rep, &off, 0x10, key_mat + 32, pkt->req + 4);
-
-	rsp[0] = EAP_CODE_SUCCESS;
-	rsp[1] = s->last_id + 1;
-	rsp[2] = 0;       /* len */
-	rsp[3] = 4;
-	app_radius_eap(pkt->rep, &off, rsp, sizeof rsp);
-
-	return compute_eap_authenticator(pkt->rep, off);
+      int err = SSL_get_error(s->ssl, len);
+      if (err == SSL_ERROR_WANT_READ) {
+	/* It was only an ACK, no data.  */
+	len = 0;
       }
       else {
-	printf ("Unhandled PEAP req in TLS\n");
+	printf ("SSL read error: len=%d, err=%d\n", len, err);
 	return -1;
       }
     }
+    if (flag_dump && len > 0) {
+      printf ("##SSL recv eap:\n");
+      dump_hex ("  ", pkt->rep, len);
+      dump_eap_response(pkt->rep, len);
+    }
   }
-  else {
+
+  switch (s->state) {
+  case S_HANDSHAKE:
+    {
+      res = SSL_accept(s->ssl);
+      if (res == 1) {
+	if (0)
+	  printf ("Handshake accepted\n");
+
+	if (SSL_version(s->ssl) > TLS1_1_VERSION) {
+	  do_eap_peap_ident(s);
+	  s->state = S_TUN_RECV_IDENTITY;
+	}
+	else
+	  s->state = S_TUN_SEND_IDENTITY;
+      }
+      else if (res == 0) {
+	log_err ("Handshake failure\n");
+	return -1;
+      }
+    }
+    break;
+  case S_TUN_SEND_IDENTITY:
+    if (len != 0)
+      log_err("Send-Identity: ignore incoming data\n");
+    do_eap_peap_ident(s);
+    s->state = S_TUN_RECV_IDENTITY;
+    break;
+  case S_TUN_RECV_IDENTITY:
+    {
+      unsigned char rsp[16];
+
+      if (len < 1 || pkt->rep[0] != EAP_TYPE_IDENTITY) {
+	log_err("Recv-Identity: expect identity answer\n");
+	return -1;
+      }
+      /* Copy user name. */
+      s->user_name[0] = len - 1;
+      memcpy(s->user_name + 1, pkt->rep + 1, len - 1);
+
+      /* Send Challenge. */
+      rsp[0] = EAP_TYPE_MD5_CHALLENGE;
+      rsp[1] = 8;  /* value size */
+      memcpy (rsp + 2, "\x12\x34\x56\x78\x9a\xbc\xde\xf0", 8);  /* value */
+      memcpy (rsp + 2 + 8, "MRname", 6);
+      if (flag_dump) {
+	printf ("SSL send md5 challenge\n");
+	dump_eap_response(rsp, sizeof rsp);
+      }
+      SSL_write (s->ssl, rsp, sizeof rsp);
+      s->state = S_TUN_RECV_CHALLENGE;
+    }
+    break;
+  case S_TUN_RECV_CHALLENGE:
+    {
+      unsigned char rsp[11];
+
+      if (len < 1 || pkt->rep[0] != EAP_TYPE_MD5_CHALLENGE) {
+	log_err("Recv-Challenge: expect challenge\n");
+	return -1;
+      }
+      /* Success.  */
+      rsp[0] = EAP_CODE_REQUEST;
+      rsp[1] = 6;  /* id */
+      rsp[2] = 0;       /* len */
+      rsp[3] = 0;
+      rsp[4] = EAP_TYPE_PEAP_EXTENSION;
+      rsp[5] = 0x80; /* Mandatory AVP */
+      rsp[6] = 0x03; /* Result */
+      rsp[7] = 0;    /* Length */
+      rsp[8] = 2;
+      rsp[9] = 0;  /* Success */
+      rsp[10] = 1;
+      rsp[3] = sizeof rsp;
+      if (flag_dump) {
+	printf ("SSL send result\n");
+	dump_eap_message(rsp, sizeof rsp);
+      }
+      SSL_write (s->ssl, rsp, sizeof rsp);
+      s->state = S_TUN_RECV_RESULT;
+    }
+    break;
+
+  case S_TUN_RECV_RESULT:
+    {
+      /* Send EAP-success */
+      unsigned char rsp[4];
+      unsigned off;
+      /* Keying material.  */
+      unsigned char key_mat[128];
+      static char label[] = "client EAP encryption"; /* RFC 5216 2.3 */
+
+      if (pkt->rep[0] != EAP_CODE_RESPONSE
+	  || len != 11
+	  // || pkt->rep[1] != 6 /* id */
+	  || read16(pkt->rep + 2) != 11 /* len */
+	  || pkt->rep[4] != EAP_TYPE_PEAP_EXTENSION
+	  || read16(pkt->rep + 5) != 0x8003 /* Result */
+	  || read16(pkt->rep + 7) != 2) {
+	log_err("Recv-Result: non-result packet\n");
+	return -1;
+      }
+      if (read16(pkt->rep + 9) != 1) {
+	log_err("Recv-Result: not a success\n");
+	return -1;
+      }
+
+      app_radius_hdr(pkt->rep, &off,
+		     CODE_ACCESS_ACCEPT, s->rad_id, pkt->req + 4);
+      app_radius_attr(pkt->rep, &off,
+		      ATTR_USER_NAME, s->user_name + 1, s->user_name[0]);
+
+      if (SSL_export_keying_material(s->ssl, key_mat, sizeof (key_mat),
+				     label, sizeof(label) - 1,
+				     NULL, 0, 0) != 1) {
+	printf ("SSL_export keying error\n");
+	return -1;
+      }
+
+      /* Encrypt recv and send keys.  RFC 2548 2.4.2 */
+      app_radius_mppe(pkt->rep, &off, 0x11, key_mat, pkt->req + 4);
+      app_radius_mppe(pkt->rep, &off, 0x10, key_mat + 32, pkt->req + 4);
+
+      rsp[0] = EAP_CODE_SUCCESS;
+      rsp[1] = s->last_id + 1;
+      rsp[2] = 0;       /* len */
+      rsp[3] = 4;
+      app_radius_eap(pkt->rep, &off, rsp, sizeof rsp);
+
+      return compute_eap_authenticator(pkt->rep, off);
+    }
+  default:
     printf ("Unhandled SSL state\n");
     return -1;
   }
 
-  {
-    unsigned char *b;
-    long len;
-
-    len = BIO_get_mem_data(s->mem_wr, (char **)&b);
-    if (0)
-      printf("BIO get_mem_data: %u\n", (unsigned)len);
-    if (len != 0) {
-      unsigned off;
-      unsigned char rsp[10];
-
-      s->rx_tx = 1;
-      s->total_len = len;
-      s->cur_len = 0;
-      s->last_id = eap_id + 1;
-      if (len > MTU)
-	len = MTU;
-      s->last_len = len;
-
-      /* Prepare the response.  */
-      app_radius_hdr(pkt->rep, &off,
-		     CODE_ACCESS_CHALLENGE, s->rad_id, pkt->req + 4);
-
-      rsp[0] = EAP_CODE_REQUEST;
-      rsp[1] = s->last_id;
-      rsp[2] = 0;       /* len */
-      rsp[3] = 0;
-      rsp[4] = EAP_TYPE_PEAP;
-      rsp[5] = PEAP_FLAG_LEN | (len < s->total_len ? PEAP_FLAG_MORE : 0);
-      write32(rsp + 6, s->total_len);
-      app_radius_peap(pkt->rep, &off, rsp, sizeof rsp, b, len);
-
-      app_radius_attr(pkt->rep, &off, ATTR_STATE,
-		      s->radius_state, sizeof s->radius_state);
-
-      return compute_eap_authenticator(pkt->rep, off);
-    }
-    printf ("SSL wants to read after rx!\n");
-    return -1;
-  }
-  printf ("Unhandled peap\n");
-  return -1;
+  res = do_eap_tun_out(pkt, s, req);
+  return res;
 }
 
 /* Handle incoming eap message. */

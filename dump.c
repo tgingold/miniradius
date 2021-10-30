@@ -69,7 +69,7 @@ disp_tls_content_type (unsigned c)
 /* TLS 1.2:
    https://datatracker.ietf.org/doc/html/rfc5246
 */
-static void
+void
 dump_tls (const unsigned char *p, unsigned plen)
 {
   while (plen > 0) {
@@ -154,6 +154,46 @@ dump_tls (const unsigned char *p, unsigned plen)
     }
 
     switch (p[5]) {
+    case TLS_HANDSHAKE_CLIENT_HELLO:
+      if (len < 47)
+	break;
+      {
+      unsigned i;
+      unsigned slen;
+      unsigned off;
+      off = 9;
+      printf ("    client_version: %u.%u\n", p[off + 0], p[off + 1]);
+      printf ("    random: ");
+      off += 2;
+      for (i = 0; i < 32; i++)
+	printf ("%02x", p[off + i]);
+      putchar('\n');
+      off += 32; /* 43 */
+      slen = p[off];
+      off += 1;
+      printf ("    session: ");
+      for (i = 0; i < slen; i++)
+	printf ("%02x", p[off + i]);
+      putchar('\n');
+      off += slen;
+      slen = read16(p + off);
+      off += 2;
+      printf ("    cipher_suites:");
+      for (i = 0; i < slen; i += 2) {
+	printf (" 0x%04x", read16(p + off));
+	off += 2;
+      }
+      putchar ('\n');
+      off += 2;
+      slen = p[off];
+      printf ("    compression_methods:");
+      for (i = 0; i < slen; i++) {
+	printf (" 0x%02x", p[off]);
+	off++;
+      }
+      putchar('\n');
+    }
+      break;
     case TLS_HANDSHAKE_SERVER_HELLO: {
       unsigned i;
       unsigned slen;

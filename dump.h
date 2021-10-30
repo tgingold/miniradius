@@ -34,5 +34,6 @@ void dump_eap_message (const unsigned char *p, unsigned plen);
 void dump_hex (const char *pfx, const unsigned char *p, unsigned len);
 void dump_radius (const unsigned char *p, unsigned plen);
 void dump_eap_response(const unsigned char *p, unsigned plen);
+void dump_tls (const unsigned char *p, unsigned plen);
 
 #endif /* _DUMP_H_ */
