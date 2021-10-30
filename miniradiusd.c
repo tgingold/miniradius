@@ -15,6 +15,7 @@
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
@@ -34,9 +35,15 @@
 #include "radius.h"
 #include "dump.h"
 
+/* If True, dump packets on stdout.  */
 static unsigned flag_dump = 0;
 
+/* UDP port for the server.  */
 unsigned port = 1812;
+
+/* Radius shared secret between this server and the clients.  */
+static unsigned char *secret;
+static unsigned secret_len;
 
 static SSL_CTX *ssl_ctxt;
 
@@ -114,9 +121,14 @@ write32 (unsigned char *p, uint32_t v)
   p[3] = v >> 0;
 }
 
-/* Radius shared secret between this server and the clients.  */
-static unsigned char *secret;
-static unsigned secret_len;
+static void
+log_err(const char *msg, ...)
+{
+  va_list args;
+  va_start(args, msg);
+  vfprintf (stderr, msg, args);
+  va_end(args);
+}
 
 /* Check authenticator attribute.
    Return 1 if OK, -1 if error, 0 if not present.  */
@@ -283,126 +295,6 @@ app_radius_peap(unsigned char *rep, unsigned *off,
 }
 
 static int
-do_eap_challenge(unsigned char *req, int rea_len,
-		 unsigned char *eap, int eap_len,
-		 unsigned char *rep)
-{
-  unsigned off;
-  unsigned char *r;
-  unsigned len;
-  unsigned char *p_mac;
-
-  /* Header.  */
-  app_radius_hdr(rep, &off, CODE_ACCESS_CHALLENGE, req[1], req + 4);
-
-  /* What do we put ?
-     Copy proxy, create state... */
-  r = rep + off;
-
-  r[0] = ATTR_EAP_MESSAGE;
-  r[1] = 0;
-  r[2] = EAP_CODE_REQUEST;
-  r[3] = eap[1] + 1;  /* id */
-  r[4] = 0;       /* len */
-  r[5] = 0;
-  if (0) {
-    r[6] = EAP_TYPE_OTP;
-    memcpy (r + 7, "otp-md5 487 dog2 ", 17);
-    r[5] = 4 + 1 + 17;
-  }
-  else if (0) {
-    r[6] = EAP_TYPE_MD5_CHALLENGE;
-    r[7] = 8;  /* value size */
-    memcpy (r + 8, "\x12\x34\x56\x78\x9a\xbc\xde\xf0", 8);  /* value */
-    memcpy (r + 16, "MRname", 6);
-    r[5] = 4 + 2 + 8 + 6;
-  }
-  else if (1) {
-    r[6] = EAP_TYPE_PEAP;
-    r[7] = PEAP_FLAG_START;
-    r[5] = 4 + 2;
-  }
-  else if (0) {
-    r[6] = EAP_TYPE_EAP_TTLS;
-    r[7] = 0x20;  /* start */
-    r[5] = 4 + 2;
-  }
-  else if (0) {
-    r[6] = EAP_TYPE_EAP_TLS;
-    r[7] = 0x20;  /* start */
-    r[5] = 4 + 2;
-  }
-  r[1] = r[5] + 2;
-  r += r[1];
-
-  /* Auth */
-  r[0] = ATTR_MESSAGE_AUTHENTICATOR;
-  r[1] = 18;
-  p_mac = r + 2;
-  memset (p_mac, 0, 16);
-  r += r[1];
-
-  /* State */
-  r[0] = ATTR_STATE;
-  r[1] = 18;
-  r[ 2] = 0x59;
-  r[ 3] = 0x35;
-  r[ 4] = 0xa8;
-  r[ 5] = 0x59;
-  r[ 6] = 0x59;
-  r[ 7] = 0x34;
-  r[ 8] = 0xa5;
-  r[ 9] = 0xd2;
-  r[10] = 0x70;
-  r[11] = 0x91;
-  r[12] = 0x10;
-  r[13] = 0xd2;
-  r[14] = 0xbd;
-  r[15] = 0x37;
-  r[16] = 0xa5;
-  r[17] = 0x5e;
-  r += r[1];
-
-  len = compute_eap_authenticator_noalloc(rep, r - rep, p_mac);
-
-  return len;
-}
-
-static int
-do_eap_auth(unsigned char *req, int rea_len,
-	    unsigned char *eap, int eap_len,
-	    unsigned char *rep)
-{
-  unsigned char *r;
-  unsigned len;
-
-  /* Header.  */
-  rep[0] = CODE_ACCESS_ACCEPT;
-  rep[1] = req[1];
-  rep[2] = 0;
-  rep[3] = 0;
-
-  /* Authenticator: copy RequestAuth.  */
-  memcpy(rep + 4, req + 4, 16);
-
-  /* What do we put ?
-     Copy proxy, create state... */
-  r = rep + 20;
-
-  r[0] = ATTR_EAP_MESSAGE;
-  r[1] = 0;
-  r[2] = EAP_CODE_SUCCESS;
-  r[3] = eap[1];  /* id */
-  r[4] = 0;       /* len */
-  r[5] = 4;
-  r += r[1];
-
-  len = compute_eap_authenticator(rep, r - rep);
-
-  return len;
-}
-
-static int
 do_eap_init(struct udp_addr *pkt,
 	    unsigned char *req, unsigned reqlen)
 {
@@ -430,7 +322,7 @@ do_eap_init(struct udp_addr *pkt,
   ctxt->rad_id = pkt->req[1];
   ctxt->last_id = req[1] + 1;
 
-  /* Prepare the response.  */
+  /* Prepare the response: start TLS.  */
   app_radius_hdr(pkt->rep, &off,
 		 CODE_ACCESS_CHALLENGE, ctxt->rad_id, pkt->req + 4);
 
@@ -446,18 +338,6 @@ do_eap_init(struct udp_addr *pkt,
 		  ATTR_STATE, ctxt->radius_state, sizeof ctxt->radius_state);
 
   return compute_eap_authenticator(pkt->rep, off);
-}
-
-static void
-BIO_discard(BIO *bio, unsigned len)
-{
-  char buf[1024];
-
-  while (len > 0) {
-    unsigned l = len > sizeof buf ? sizeof buf : len;
-    BIO_read(bio, buf, l);
-    len -= l;
-  }
 }
 
 /* RFC 2548 p21-22 */
@@ -517,6 +397,18 @@ app_radius_mppe (unsigned char *rep, unsigned *off,
   app_radius_attr(rep, off, ATTR_VENDOR_SPECIFIC, mppe_attr, sizeof mppe_attr);
 }
 
+static void
+BIO_discard(BIO *bio, unsigned len)
+{
+  char buf[1024];
+
+  while (len > 0) {
+    unsigned l = len > sizeof buf ? sizeof buf : len;
+    BIO_read(bio, buf, l);
+    len -= l;
+  }
+}
+
 static int
 do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	    unsigned char *req, unsigned reqlen)
@@ -524,6 +416,12 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
   int res;
   unsigned char eap_id;
   unsigned char pflags;
+
+  /* Handle only PEAP.  */
+  if (req[4] != EAP_TYPE_PEAP) {
+    log_err ("Unhandled eap response type (%u)\n", req[4]);
+    return -1;
+  }
 
   /* Ok, we have something for TLS.  */
   if (s->state == S_INIT) {
@@ -545,7 +443,7 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
   pflags = req[5];
 
   if (pflags & PEAP_FLAG_START) {
-    printf ("Unexpected start\n");
+    log_err ("Unexpected start\n");
     return -1;
   }
   if ((pflags & PEAP_FLAG_MASK) == 0 && reqlen == 6) {
@@ -582,6 +480,7 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	len = MTU;
       s->last_len = len;
 
+      /* Send the next fragment.  */
       app_radius_hdr(pkt->rep, &off,
 		     CODE_ACCESS_CHALLENGE, s->rad_id, pkt->req + 4);
 
@@ -852,6 +751,7 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
   return -1;
 }
 
+/* Handle incoming eap message. */
 static int
 handle_eap_message(struct udp_addr *pkt, unsigned char *state,
 		   unsigned char *eap, unsigned eap_len)
@@ -860,12 +760,12 @@ handle_eap_message(struct udp_addr *pkt, unsigned char *state,
 
   /* Sanity check.  */
   if (eap_len < 4) {
-    printf ("Bad EAP-Message packet length\n");
+    log_err ("Bad EAP-Message packet length\n");
     return -1;
   }
 
   if (read16(eap + 2) != eap_len) {
-    printf ("Bad EAP-Message length field\n");
+    log_err ("Bad EAP-Message length field\n");
     return -1;
   }
 
@@ -875,6 +775,7 @@ handle_eap_message(struct udp_addr *pkt, unsigned char *state,
     unsigned i;
     for (i = 0; i < NBR_EAP_CTXTS; i++) {
       ctxt = &eap_ctxts[i];
+      /* TODO: check IP saddr, UDP sport.  */
       if (ctxt->state != S_FREE
 	  && state[1] - 2 == sizeof (ctxt->radius_state)
 	  && memcmp (state + 2,
@@ -883,7 +784,7 @@ handle_eap_message(struct udp_addr *pkt, unsigned char *state,
       ctxt = NULL;
     }
     if (ctxt == NULL) {
-      printf ("State present but not found\n");
+      log_err ("State present but not found\n");
       return -1;
     }
   }
@@ -892,32 +793,30 @@ handle_eap_message(struct udp_addr *pkt, unsigned char *state,
     if (eap_len < 5)
       return -1;
 
-    switch (eap[4]) {
-    case EAP_TYPE_IDENTITY:
-      /* This is the first message: the identity has been transmitted,
-	 time to challenge.  */
-      /* Create a context:
-	 - ip+port, random, number
-	 - extract user
-	 - extract MTU
-	 - extract calling station id, called station id...
-      */
-      if (1)
+    if (ctxt == NULL) {
+      /* First packet.  */
+      if (eap[4] == EAP_TYPE_IDENTITY) {
+	/* This is the first message: the identity has been transmitted,
+	   time to challenge.  */
+	/* Create a context:
+	   - ip+port, random, number
+	   - extract user
+	   - extract MTU
+	   - extract calling station id, called station id...
+	*/
 	return do_eap_init(pkt, eap, eap_len);
-      else
-	return do_eap_challenge(pkt->req, pkt->reqlen, eap, eap_len, pkt->rep);
-    case EAP_TYPE_PEAP:
-    case EAP_TYPE_EAP_TTLS:
+      }
+      else {
+	log_err ("eap response without a context\n");
+	return -1;
+      }
+    }
+    else {
       return do_eap_peap(pkt, ctxt, eap, eap_len);
-    case EAP_TYPE_MD5_CHALLENGE:
-      return do_eap_auth(pkt->req, pkt->reqlen, eap, eap_len, pkt->rep);
-    default:
-      printf ("Unhandled eap response type (%u)\n", eap[4]);
-      break;
     }
   }
   else {
-    printf ("Unhandled eap code (%u)\n", eap[0]);
+    log_err ("Unhandled eap code (%u)\n", eap[0]);
   }
 
   return 0;
@@ -932,13 +831,14 @@ handle_access_request(struct udp_addr *pkt)
   int auth;
   unsigned off;
 
+  /* Authenticate. */
   auth = auth_request(pkt->req, pkt->reqlen);
   if (auth < 0) {
-    printf ("Authentification failed\n");
+    log_err ("Authentification failed\n");
     return -1;
   }
   else if (auth == 0) {
-    printf ("Non authentified packet\n");
+    log_err ("Non authentified packet\n");
     return -1;
   }
 
@@ -964,10 +864,39 @@ handle_access_request(struct udp_addr *pkt)
     return handle_eap_message(pkt, state, eap_buf, eap_len);
   }
   else {
-    /* TODO: handle non EAP.  */
-    printf ("Not handled: non-EAP request\n");
+    log_err ("not handled: non-EAP request\n");
     return -1;
   }
+}
+
+/* Check the request PKT is well-formed (attributes length is ok). */
+static int
+check_radius_packet(struct udp_addr *pkt, unsigned plen)
+{
+  unsigned off;
+
+  if (plen < 20 || plen > 4096)
+    return -1;
+  pkt->reqlen = read16(pkt->req + 2);
+  if (pkt->reqlen < 20 || pkt->reqlen > plen)
+    return -1;
+
+  for (off = 20; off < pkt->reqlen; ) {
+    unsigned rlen = pkt->reqlen - off;
+    unsigned alen;
+
+    if (rlen < 2) {
+      /* Need at least two bytes for an attribute.  */
+      return -1;
+    }
+    alen = pkt->req[off + 1];
+    if (alen > rlen) {
+      /* Length of the attribute exceed the packet length.  */
+      return -1;
+    }
+    off += alen;
+  }
+  return 0;
 }
 
 /* Initialize openssl, read certificate and private key.  */
@@ -1067,27 +996,31 @@ server(unsigned flag_write)
     }
 
     /* Discard invalid packets.  */
-    if (r < 20 || r > 4096)
+    if (check_radius_packet(&uaddr, r) < 0) {
+      log_err ("bad radius packet\n");
       continue;
-    uaddr.reqlen = read16(uaddr.req + 2);
-    if (uaddr.reqlen < 20 || uaddr.reqlen > r)
-      continue;
+    }
 
     if (flag_write)
       write(bin_log, uaddr.req, uaddr.reqlen);
 
-    /* TODO: check attributes (length)  */
-
-    if (uaddr.req[0] == CODE_ACCESS_REQUEST)
+    /* Handle packet.  */
+    switch (uaddr.req[0]) {
+    case CODE_ACCESS_REQUEST:
       res = handle_access_request(&uaddr);
-    else {
-      printf ("unhandled\n");
+      break;
+    default:
+      log_err ("unhandled radius req 0x%02x\n", uaddr.req[0]);
+      res = 0;
+      break;
+    }
+
+    if (res <= 0) {
+      /* Nothing to send. */
       continue;
     }
 
-    if (res <= 0)
-      continue;
-
+    /* Send reply. */
     if (flag_dump) {
       if (uaddr.caddr.sa_family == AF_INET) {
 	struct sockaddr_in *sin = (struct sockaddr_in *)&uaddr.caddr;
