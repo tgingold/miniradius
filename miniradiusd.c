@@ -33,6 +33,7 @@
 
 #include "hmac_md5.h"
 #include "radius.h"
+#include "users.h"
 #include "dump.h"
 
 /* If True, dump packets on stdout.  */
@@ -102,7 +103,8 @@ struct eap_ctxt {
   BIO *mem_wr;  /* Data to be sent to client.  */
   SSL *ssl;
 
-  unsigned char user_name[32];
+  unsigned char challenge[16];
+  struct user *user;
 };
 
 #define NBR_EAP_CTXTS 8
@@ -131,6 +133,15 @@ write32 (unsigned char *p, uint32_t v)
 
 static void
 log_err(const char *msg, ...)
+{
+  va_list args;
+  va_start(args, msg);
+  vfprintf (stderr, msg, args);
+  va_end(args);
+}
+
+static void
+log_info(const char *msg, ...)
 {
   va_list args;
   va_start(args, msg);
@@ -241,7 +252,7 @@ compute_eap_authenticator (unsigned char *rep, unsigned int len)
 static void
 app_radius_hdr (unsigned char *rep, unsigned *off,
 		unsigned char code, unsigned char id,
-		unsigned char *reqauth)
+		const unsigned char *reqauth)
 {
   /* Header.  */
   rep[0] = code;
@@ -257,7 +268,7 @@ app_radius_hdr (unsigned char *rep, unsigned *off,
 
 static void
 app_radius_attr(unsigned char *rep, unsigned *off,
-		unsigned char code, unsigned char *buf, unsigned len)
+		unsigned char code, const unsigned char *buf, unsigned len)
 {
   unsigned l = *off;
   assert(l + len < BUF_LEN);
@@ -286,7 +297,7 @@ app_radius_eap(unsigned char *rep, unsigned *off,
 static void
 app_radius_peap(unsigned char *rep, unsigned *off,
 		unsigned char *hdr, unsigned hlen,
-		unsigned char *buf, unsigned len)
+		const unsigned char *buf, unsigned len)
 {
   hdr[2] = (hlen + len) >> 8;
   hdr[3] = (hlen + len) >> 0;
@@ -683,8 +694,10 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	  do_eap_peap_ident(s);
 	  s->state = S_TUN_RECV_IDENTITY;
 	}
-	else
+	else {
+	  /* Some old clients won't accept data before an ack.  */
 	  s->state = S_TUN_SEND_IDENTITY;
+	}
       }
       else if (res == 0) {
 	log_err ("Handshake failure\n");
@@ -700,21 +713,21 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
     break;
   case S_TUN_RECV_IDENTITY:
     {
-      unsigned char rsp[16];
+      unsigned char rsp[2 + sizeof s->challenge + 2];
 
       if (len < 1 || pkt->rep[0] != EAP_TYPE_IDENTITY) {
 	log_err("Recv-Identity: expect identity answer\n");
 	return -1;
       }
       /* Copy user name. */
-      s->user_name[0] = len - 1;
-      memcpy(s->user_name + 1, pkt->rep + 1, len - 1);
+      s->user = get_user(pkt->rep + 1, len - 1);
 
       /* Send Challenge. */
       rsp[0] = EAP_TYPE_MD5_CHALLENGE;
-      rsp[1] = 8;  /* value size */
-      memcpy (rsp + 2, "\x12\x34\x56\x78\x9a\xbc\xde\xf0", 8);  /* value */
-      memcpy (rsp + 2 + 8, "MRname", 6);
+      rsp[1] = sizeof s->challenge;  /* value size */
+      RAND_bytes(s->challenge, sizeof s->challenge);
+      memcpy (rsp + 2, s->challenge, sizeof s->challenge);  /* value */
+      memcpy (rsp + 2 + sizeof s->challenge, "mr", 2);      /* name */
       if (flag_dump) {
 	printf ("SSL send md5 challenge\n");
 	dump_eap_response(rsp, sizeof rsp);
@@ -726,24 +739,55 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
   case S_TUN_RECV_CHALLENGE:
     {
       unsigned char rsp[11];
+      MD5_CTX md5_ctxt;
+      unsigned status;
 
       if (len < 1 || pkt->rep[0] != EAP_TYPE_MD5_CHALLENGE) {
 	log_err("Recv-Challenge: expect challenge\n");
 	return -1;
       }
-      /* Success.  */
+      /* Check result.
+	 RFC 1994: the response value is the one-way hash calculated over
+	 a stream of octets consisting of the Identifier, followed by
+	 (concatenated with) the "secret", followed by (concatenated with)
+	 the Challenge Value. */
+      if (len != 16 + 2 || pkt->rep[1] != 16) {
+	log_err("Recv-Challenge: bad challenge reply length\n");
+	return -1;
+      }
+      status = 2; /* Failure */
+      if (s->user) {
+	unsigned char challenge[16];
+
+	MD5_Init (&md5_ctxt);
+	MD5_Update (&md5_ctxt, req + 1, 1); /* Identifier */
+	MD5_Update (&md5_ctxt, s->user->pass, strlen (s->user->pass));
+	MD5_Update (&md5_ctxt, s->challenge, sizeof s->challenge);
+	MD5_Final (challenge, &md5_ctxt);
+
+	if (memcmp (challenge, pkt->rep + 2, sizeof challenge) == 0) {
+	  status = 1;
+	  log_info("user %s accepted\n", s->user->name);
+	}
+	else
+	  log_err("Recv-Challenge: failure due to mismatch\n");
+      }
+      else {
+	log_err("Recv-Challenge: failure due to unknown user\n");
+      }
+
+      /* Result.  */
       rsp[0] = EAP_CODE_REQUEST;
       rsp[1] = 6;  /* id */
       rsp[2] = 0;       /* len */
-      rsp[3] = 0;
+      rsp[3] = sizeof rsp;
       rsp[4] = EAP_TYPE_PEAP_EXTENSION;
       rsp[5] = 0x80; /* Mandatory AVP */
       rsp[6] = 0x03; /* Result */
       rsp[7] = 0;    /* Length */
       rsp[8] = 2;
-      rsp[9] = 0;  /* Success */
-      rsp[10] = 1;
-      rsp[3] = sizeof rsp;
+      rsp[9] = 0;  /* result */
+      rsp[10] = status;
       if (flag_dump) {
 	printf ("SSL send result\n");
 	dump_eap_message(rsp, sizeof rsp);
@@ -779,8 +823,11 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 
       app_radius_hdr(pkt->rep, &off,
 		     CODE_ACCESS_ACCEPT, s->rad_id, pkt->req + 4);
-      app_radius_attr(pkt->rep, &off,
-		      ATTR_USER_NAME, s->user_name + 1, s->user_name[0]);
+      if (s->user) {
+	unsigned ulen = strlen(s->user->name);
+	app_radius_attr(pkt->rep, &off, ATTR_USER_NAME,
+			(const unsigned char *)s->user->name, ulen);
+      }
 
       if (SSL_export_keying_material(s->ssl, key_mat, sizeof (key_mat),
 				     label, sizeof(label) - 1,
