@@ -104,6 +104,7 @@ struct eap_ctxt {
   SSL *ssl;
 
   unsigned char challenge[16];
+  unsigned char success;
   struct user *user;
 };
 
@@ -120,6 +121,13 @@ static uint32_t
 read32 (const unsigned char *p)
 {
   return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+}
+
+static void
+write16 (unsigned char *p, uint16_t v)
+{
+  p[0] = v >> 8;
+  p[1] = v >> 0;
 }
 
 static void
@@ -740,7 +748,6 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
     {
       unsigned char rsp[11];
       MD5_CTX md5_ctxt;
-      unsigned status;
 
       if (len < 1 || pkt->rep[0] != EAP_TYPE_MD5_CHALLENGE) {
 	log_err("Recv-Challenge: expect challenge\n");
@@ -751,11 +758,11 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	 a stream of octets consisting of the Identifier, followed by
 	 (concatenated with) the "secret", followed by (concatenated with)
 	 the Challenge Value. */
-      if (len != 16 + 2 || pkt->rep[1] != 16) {
+      if (len < 16 + 2 || pkt->rep[1] != 16) {
 	log_err("Recv-Challenge: bad challenge reply length\n");
 	return -1;
       }
-      status = 2; /* Failure */
+      s->success = 0;
       if (s->user) {
 	unsigned char challenge[16];
 
@@ -766,7 +773,7 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	MD5_Final (challenge, &md5_ctxt);
 
 	if (memcmp (challenge, pkt->rep + 2, sizeof challenge) == 0) {
-	  status = 1;
+	  s->success = 1;
 	  log_info("user %s accepted\n", s->user->name);
 	}
 	else
@@ -782,12 +789,11 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       rsp[2] = 0;       /* len */
       rsp[3] = sizeof rsp;
       rsp[4] = EAP_TYPE_PEAP_EXTENSION;
-      rsp[5] = 0x80; /* Mandatory AVP */
-      rsp[6] = 0x03; /* Result */
+      write16(rsp + 5, EAP_ETYPE_RESULT);  /* Madatory AVP result */
       rsp[7] = 0;    /* Length */
       rsp[8] = 2;
       rsp[9] = 0;  /* result */
-      rsp[10] = status;
+      rsp[10] = s->success ? RESULT_SUCCESS : RESULT_FAILURE;
       if (flag_dump) {
 	printf ("SSL send result\n");
 	dump_eap_message(rsp, sizeof rsp);
@@ -802,6 +808,7 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       /* Send EAP-success */
       unsigned char rsp[4];
       unsigned off;
+      unsigned eresult = s->success ? RESULT_SUCCESS : RESULT_FAILURE;
       /* Keying material.  */
       unsigned char key_mat[128];
       static char label[] = "client EAP encryption"; /* RFC 5216 2.3 */
@@ -811,36 +818,39 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	  // || pkt->rep[1] != 6 /* id */
 	  || read16(pkt->rep + 2) != 11 /* len */
 	  || pkt->rep[4] != EAP_TYPE_PEAP_EXTENSION
-	  || read16(pkt->rep + 5) != 0x8003 /* Result */
+	  || read16(pkt->rep + 5) != EAP_ETYPE_RESULT
 	  || read16(pkt->rep + 7) != 2) {
 	log_err("Recv-Result: non-result packet\n");
 	return -1;
       }
-      if (read16(pkt->rep + 9) != 1) {
-	log_err("Recv-Result: not a success\n");
+      if (read16(pkt->rep + 9) != eresult) {
+	log_err("Recv-Result: result mismatch!\n");
 	return -1;
       }
 
       app_radius_hdr(pkt->rep, &off,
-		     CODE_ACCESS_ACCEPT, s->rad_id, pkt->req + 4);
+		     s->success ? CODE_ACCESS_ACCEPT : CODE_ACCESS_REJECT,
+		     s->rad_id, pkt->req + 4);
       if (s->user) {
 	unsigned ulen = strlen(s->user->name);
 	app_radius_attr(pkt->rep, &off, ATTR_USER_NAME,
 			(const unsigned char *)s->user->name, ulen);
       }
 
-      if (SSL_export_keying_material(s->ssl, key_mat, sizeof (key_mat),
-				     label, sizeof(label) - 1,
-				     NULL, 0, 0) != 1) {
-	printf ("SSL_export keying error\n");
-	return -1;
+      if (s->success) {
+	if (SSL_export_keying_material(s->ssl, key_mat, sizeof (key_mat),
+				       label, sizeof(label) - 1,
+				       NULL, 0, 0) != 1) {
+	  printf ("SSL_export keying error\n");
+	  return -1;
+	}
+
+	/* Encrypt recv and send keys.  RFC 2548 2.4.2 */
+	app_radius_mppe(pkt->rep, &off, 0x11, key_mat, pkt->req + 4);
+	app_radius_mppe(pkt->rep, &off, 0x10, key_mat + 32, pkt->req + 4);
       }
 
-      /* Encrypt recv and send keys.  RFC 2548 2.4.2 */
-      app_radius_mppe(pkt->rep, &off, 0x11, key_mat, pkt->req + 4);
-      app_radius_mppe(pkt->rep, &off, 0x10, key_mat + 32, pkt->req + 4);
-
-      rsp[0] = EAP_CODE_SUCCESS;
+      rsp[0] = s->success ? EAP_CODE_SUCCESS : EAP_CODE_FAILURE;
       rsp[1] = s->last_id + 1;
       rsp[2] = 0;       /* len */
       rsp[3] = 4;
