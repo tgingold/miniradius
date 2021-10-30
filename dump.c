@@ -570,7 +570,7 @@ dump_radius (const unsigned char *p, unsigned plen)
 }
 
 int
-test_server(void)
+dump_packets(void)
 {
   unsigned char buf[4096];
   int len;

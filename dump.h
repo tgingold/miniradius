@@ -28,7 +28,7 @@ extern unsigned dump_eap_only;
 int dump_pcap(void);
 
 /* Read and dump raw radius packets from stdin.  */
-int test_server(void);
+int dump_packets(void);
 
 void dump_eap_message (const unsigned char *p, unsigned plen);
 void dump_hex (const char *pfx, const unsigned char *p, unsigned len);

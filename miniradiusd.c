@@ -1089,8 +1089,8 @@ main (int argc, char *argv[])
       dump_eap_only = 1;
     else if (strcmp (argv[0], "-r") == 0)
       flag_dump = 1;
-    else if (strcmp(argv[0], "-") == 0)
-      return test_server();
+    else if (strcmp(argv[0], "-R") == 0)
+      return dump_packets();
     else {
       fprintf (stderr, "unknown option %s\n", argv[0]);
       return 2;
