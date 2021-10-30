@@ -955,6 +955,7 @@ handle_access_request(struct udp_addr *pkt)
   }
 }
 
+/* Initialize openssl, read certificate and private key.  */
 static SSL_CTX *
 init_openssl(void)
 {
@@ -970,7 +971,7 @@ init_openssl(void)
   if (!ctx) {
     perror("Unable to create SSL context");
     ERR_print_errors_fp(stderr);
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   SSL_CTX_set_ecdh_auto(ctx, 1);
@@ -978,25 +979,27 @@ init_openssl(void)
   /* Set the key and cert */
   if (SSL_CTX_use_certificate_file(ctx, "cert.pem", SSL_FILETYPE_PEM) <= 0) {
     ERR_print_errors_fp(stderr);
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   if (SSL_CTX_use_PrivateKey_file(ctx, "key.pem", SSL_FILETYPE_PEM) <= 0 ) {
     ERR_print_errors_fp(stderr);
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   return ctx;
 }
 
 static int
-server(void)
+server(unsigned flag_write)
 {
   int sock;
   struct sockaddr_in myaddr;
   int bin_log;
 
   ssl_ctxt = init_openssl();
+  if (ssl_ctxt == NULL)
+    return 1;
 
   sock = socket (PF_INET, SOCK_DGRAM, 0);
   if (sock < 0) {
@@ -1014,9 +1017,13 @@ server(void)
     return 1;
   }
 
-  bin_log = open("miniradius.pkt", O_WRONLY | O_CREAT | O_APPEND, 0600);
-  if (bin_log < 0)
-    perror("cannot open log file");
+  if (flag_write) {
+    bin_log = open("miniradius.pkt", O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (bin_log < 0) {
+      perror("cannot open log file");
+      return 2;
+    }
+  }
 
   while (1) {
     struct udp_addr uaddr;
@@ -1049,7 +1056,7 @@ server(void)
     if (uaddr.reqlen < 20 || uaddr.reqlen > r)
       continue;
 
-    if (bin_log >= 0)
+    if (flag_write)
       write(bin_log, uaddr.req, uaddr.reqlen);
 
     /* TODO: check attributes (length)  */
@@ -1070,7 +1077,7 @@ server(void)
 	      inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), res);
     }
     dump_radius(uaddr.rep, res);
-    if (bin_log >= 0)
+    if (flag_write)
       write(bin_log, uaddr.rep, res);
 
     r = sendto (sock, uaddr.rep, res, 0, &uaddr.caddr, uaddr.caddr.sa_len);
@@ -1083,7 +1090,8 @@ int
 main (int argc, char *argv[])
 {
   const char *progname = argv[0];
-  unsigned flag_dump = 0;
+  unsigned flag_dump_pcap = 0;
+  unsigned flag_write = 0;
 
   /* Skip progname. */
   argv++;
@@ -1094,7 +1102,9 @@ main (int argc, char *argv[])
     if (strcmp (argv[0], "-de") == 0)
       dump_eap_only = 1;
     else if (strcmp (argv[0], "-r") == 0)
-      flag_dump = 1;
+      flag_dump_pcap = 1;
+    else if (strcmp (argv[0], "-W") == 0)
+      flag_write = 1;
     else if (strcmp(argv[0], "-R") == 0)
       return dump_packets();
     else if (strcmp(argv[0], "-s") == 0) {
@@ -1115,7 +1125,7 @@ main (int argc, char *argv[])
     argc--;
   }
 
-  if (flag_dump)
+  if (flag_dump_pcap)
     return dump_pcap();
 
   if (secret == NULL) {
@@ -1123,5 +1133,5 @@ main (int argc, char *argv[])
     return 2;
   }
 
-  return server();
+  return server(flag_write);
 }
