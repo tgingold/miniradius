@@ -112,9 +112,12 @@ write32 (unsigned char *p, uint32_t v)
   p[3] = v >> 0;
 }
 
-static unsigned char key[] = "pass";
-static unsigned key_len = sizeof(key) - 1;
+/* Radius shared secret between this server and the clients.  */
+static unsigned char *secret;
+static unsigned secret_len;
 
+/* Check authenticator attribute.
+   Return 1 if OK, -1 if error, 0 if not present.  */
 static int
 auth_request(unsigned char *p, int plen)
 {
@@ -132,7 +135,7 @@ auth_request(unsigned char *p, int plen)
       memcpy (digest, p + off + 2, 16);
       memset (p + off + 2, 0, 16);
 
-      hmac_md5(p, plen, key, key_len, computed_digest);
+      hmac_md5(p, plen, secret, secret_len, computed_digest);
       memcpy (p + off + 2, digest, 16);
       if (memcmp(computed_digest, digest, 16) != 0)
 	return -1;
@@ -145,7 +148,8 @@ auth_request(unsigned char *p, int plen)
   return 0;
 }
 
-
+/* Compute authenticator attribute (and write to P_MAC) and authenticator
+   field.  */
 static unsigned int
 compute_eap_authenticator_noalloc (unsigned char *rep, unsigned int len,
 				   unsigned char *p_mac)
@@ -173,7 +177,7 @@ compute_eap_authenticator_noalloc (unsigned char *rep, unsigned int len,
      integrity check.  The Message-Authenticator is calculated and
      inserted in the packet before the Response Authenticator is
      calculated.  */
-  hmac_md5(rep, len, key, key_len, p_mac);
+  hmac_md5(rep, len, secret, secret_len, p_mac);
 
   /* Compute Authenticator.
      From RFC 2865, 3 Packet Format
@@ -190,7 +194,7 @@ compute_eap_authenticator_noalloc (unsigned char *rep, unsigned int len,
        where + denotes concatenation.  */
   MD5Init (&md5_ctxt);
   MD5Update (&md5_ctxt, rep, len);
-  MD5Update (&md5_ctxt, key, key_len);
+  MD5Update (&md5_ctxt, secret, secret_len);
   MD5Final (rep + 4, &md5_ctxt);
 
   return len;
@@ -505,7 +509,7 @@ app_radius_mppe (unsigned char *rep, unsigned *off,
 
   mppe_in[0] = 32; /* key length */
   memcpy (mppe_in + 1, key_mat, 32);
-  mppe_encrypt(mppe_attr + 6, auth, key, key_len,
+  mppe_encrypt(mppe_attr + 6, auth, secret, secret_len,
 	       mppe_in, sizeof mppe_in, mppe_attr + 8);
 
   app_radius_attr(rep, off, ATTR_VENDOR_SPECIFIC, mppe_attr, sizeof mppe_attr);
@@ -1078,12 +1082,14 @@ server(void)
 int
 main (int argc, char *argv[])
 {
+  const char *progname = argv[0];
   unsigned flag_dump = 0;
 
   /* Skip progname. */
   argv++;
   argc--;
 
+  /* Simple option decoder.  */
   while (argc > 0) {
     if (strcmp (argv[0], "-de") == 0)
       dump_eap_only = 1;
@@ -1091,6 +1097,16 @@ main (int argc, char *argv[])
       flag_dump = 1;
     else if (strcmp(argv[0], "-R") == 0)
       return dump_packets();
+    else if (strcmp(argv[0], "-s") == 0) {
+      if (argc < 2) {
+	fprintf (stderr, "missing value for option -s\n");
+	return 2;
+      }
+      secret = (unsigned char *)argv[1];
+      secret_len = strlen(argv[1]);
+      argv++;
+      argc--;
+    }
     else {
       fprintf (stderr, "unknown option %s\n", argv[0]);
       return 2;
@@ -1101,6 +1117,11 @@ main (int argc, char *argv[])
 
   if (flag_dump)
     return dump_pcap();
-  else
-    return server();
+
+  if (secret == NULL) {
+    fprintf (stderr, "%s: missing secret option (-s SECRET)\n", progname);
+    return 2;
+  }
+
+  return server();
 }
