@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <assert.h>
 
+#include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
@@ -65,6 +66,8 @@ struct eap_ctxt {
   BIO *mem_rd;  /* Data read from client.  */
   BIO *mem_wr;  /* Data to be sent to client.  */
   SSL *ssl;
+
+  unsigned char user_name[32];
 };
 
 #define NBR_EAP_CTXTS 8
@@ -74,6 +77,12 @@ static uint16_t
 read16 (const unsigned char *p)
 {
   return (p[0] << 8) | p[1];
+}
+
+static uint32_t
+read24 (const unsigned char *p)
+{
+  return (p[0] << 16) | (p[1] << 8) | p[2];
 }
 
 static uint32_t
@@ -184,6 +193,22 @@ write32 (unsigned char *p, uint32_t v)
 #define PEAP_FLAG_MORE  0x40
 #define PEAP_FLAG_LEN   0x80
 
+#define TLS_TYPE_CHANGE_CIPHER_SPEC 20
+#define TLS_TYPE_ALERT 21
+#define TLS_TYPE_HANDSHAKE 22
+#define TLS_TYPE_APPLICATION_DATA 23
+
+#define TLS_HANDSHAKE_HELLO_REQUEST 0
+#define TLS_HANDSHAKE_CLIENT_HELLO 1
+#define TLS_HANDSHAKE_SERVER_HELLO 2
+#define TLS_HANDSHAKE_CERTIFICATE 11
+#define TLS_HANDSHAKE_SERVER_KEY_EXCHANGE 12
+#define TLS_HANDSHAKE_CERTIFICATE_REQUEST 13
+#define TLS_HANDSHAKE_SERVER_HELLO_DONE 14
+#define TLS_HANDSHAKE_CERTIFICATE_VERIFY 15
+#define TLS_HANDSHAKE_CLIENT_KEY_EXCHANGE 16
+#define TLS_HANDSHAKE_FINISHED 20
+
 static unsigned char key[] = "pass";
 static unsigned key_len = sizeof(key) - 1;
 
@@ -203,13 +228,13 @@ static const char *
 disp_tls_content_type (unsigned c)
 {
   switch (c) {
-  case 20:
+  case TLS_TYPE_CHANGE_CIPHER_SPEC:
     return "change_cipher_spec";
-  case 21:
+  case TLS_TYPE_ALERT:
     return "alert";
-  case 22:
+  case TLS_TYPE_HANDSHAKE:
     return "handshake";
-  case 23:
+  case TLS_TYPE_APPLICATION_DATA:
     return "application_data";
   default:
     return "??";
@@ -222,11 +247,116 @@ disp_tls_content_type (unsigned c)
 static void
 dump_tls (const unsigned char *p, unsigned plen)
 {
-  unsigned len;
-  printf ("   type: %02x %s", p[0], disp_tls_content_type (p[0]));
-  printf (",  protocol version: %u.%u", p[1], p[2]);
-  len = (p[3] << 8) | p[4];
-  printf (",  len: %u\n", len);
+  while (plen > 0) {
+    unsigned len;
+    unsigned char typ;
+
+    if (plen < 4) {
+      printf ("   ...truncated\n");
+      break;
+    }
+    typ = p[0];
+    printf ("   type: %u %s", typ, disp_tls_content_type (typ));
+    printf (",  protocol version: %u.%u", p[1], p[2]);
+    len = read16(p + 3);
+    printf (",  len: %u\n", len);
+
+    if (len + 5 > plen) {
+      printf ("   ...(truncated)\n");
+      break;
+    }
+
+    switch (typ) {
+    case TLS_TYPE_CHANGE_CIPHER_SPEC:
+      if (len != 1)
+	printf ("    bad length\n");
+      else
+	printf ("    new spec: %u\n", p[5]);
+      break;
+    case TLS_TYPE_ALERT:
+      if (len != 2)
+	printf ("    bad length\n");
+      else
+	printf ("    level: %u, desc: %u\n", p[5], p[6]);
+      break;
+    case TLS_TYPE_HANDSHAKE: {
+      unsigned blen;
+      if (len < 4) {
+	printf ("    bad length\n");
+	break;
+      }
+      blen = read24(p + 6);
+      printf ("    msg type: %u, len: %u  ", p[5], blen);
+      switch (p[5]) {
+      case TLS_HANDSHAKE_HELLO_REQUEST:
+	printf ("hello request");
+	break;
+      case TLS_HANDSHAKE_CLIENT_HELLO:
+	printf ("client_hello");
+	break;
+      case TLS_HANDSHAKE_SERVER_HELLO:
+	printf ("server_hello");
+	break;
+      case TLS_HANDSHAKE_CERTIFICATE:
+	printf ("certificate");
+	break;
+      case TLS_HANDSHAKE_SERVER_KEY_EXCHANGE:
+	printf ("server_key_exchange");
+	break;
+      case TLS_HANDSHAKE_CERTIFICATE_REQUEST:
+	printf ("certificate_request");
+	break;
+      case TLS_HANDSHAKE_SERVER_HELLO_DONE:
+	printf ("server_hello_done");
+	break;
+      case TLS_HANDSHAKE_CERTIFICATE_VERIFY:
+	printf ("certificate_verify");
+	break;
+      case TLS_HANDSHAKE_CLIENT_KEY_EXCHANGE:
+	printf ("client_key_exchange");
+	break;
+      case TLS_HANDSHAKE_FINISHED:
+	printf ("finished");
+	break;
+      }
+      if (blen != len - 4)
+	printf (" [weird len]");
+      putchar('\n');
+      break;
+    }
+    default:
+      break;
+    }
+
+    switch (p[5]) {
+    case TLS_HANDSHAKE_SERVER_HELLO: {
+      unsigned i;
+      unsigned slen;
+      unsigned off;
+      off = 9;
+      printf ("    server_version: %u.%u\n", p[off + 0], p[off + 1]);
+      printf ("    random: ");
+      off += 2;
+      for (i = 0; i < 32; i++)
+	printf ("%02x", p[off + i]);
+      putchar('\n');
+      off += 32; /* 43 */
+      slen = p[off];
+      off += 1;
+      printf ("    session: ");
+      for (i = 0; i < slen; i++)
+	printf ("%02x", p[off + i]);
+      putchar('\n');
+      off += slen;
+      printf ("    cipher_suite: 0x%04x\n", read16(p + off));
+      off += 2;
+      printf ("    compression_method: 0x%02x\n", p[off]);
+    }
+      break;
+    }
+    p += len + 5;
+    plen -= len + 5;
+  }
 }
 
 /* See:
@@ -826,7 +956,7 @@ do_eap_challenge(unsigned char *req, int rea_len,
     r[7] = 0x20;  /* start */
     r[5] = 4 + 2;
   }
-  else if (1) {
+  else if (0) {
     r[6] = EAP_TYPE_EAP_TLS;
     r[7] = 0x20;  /* start */
     r[5] = 4 + 2;
@@ -957,6 +1087,63 @@ BIO_discard(BIO *bio, unsigned len)
     BIO_read(bio, buf, l);
     len -= l;
   }
+}
+
+/* RFC 2548 p21-22 */
+static void
+mppe_encrypt (const unsigned char *salt,
+	      const unsigned char *auth,
+	      const unsigned char *secret, unsigned secret_len,
+	      const unsigned char *key, unsigned key_len,
+	      unsigned char *out)
+{
+  unsigned i;
+  for (i = 0; i < key_len; i += 16) {
+    struct MD5Context md5_ctxt;
+    unsigned char b[16];
+    unsigned j;
+
+    MD5Init (&md5_ctxt);
+    MD5Update (&md5_ctxt, secret, secret_len);
+    if (i == 0) {
+      MD5Update (&md5_ctxt, auth, 16);
+      MD5Update (&md5_ctxt, salt, 2);
+    }
+    else
+      MD5Update (&md5_ctxt, out + i - 16, 16);
+    MD5Final (b, &md5_ctxt);
+
+    for (j = 0; j < 16; j++) {
+      unsigned char p;
+      if (i + j >= key_len)
+	p = 0;
+      else
+	p = key[i + j];
+      out[i + j] = p ^ b[j];
+    }
+  }
+}
+
+static void
+app_radius_mppe (unsigned char *rep, unsigned *off,
+		 unsigned vendor_type, unsigned char *key_mat,
+		 unsigned char *auth)
+{
+  unsigned char mppe_attr[4 + 2 + 2 + 48];
+  unsigned char mppe_in[32 + 1];
+
+  write32(mppe_attr, 0x137);  /* MS vendor */
+  mppe_attr[4] = vendor_type;        /* Type: ms-mppe-recv-key */
+  mppe_attr[5] = 2 + 2 + 48;
+  RAND_bytes(mppe_attr + 6, 2);  /* salt */
+  mppe_attr[6] |= 0x80;
+
+  mppe_in[0] = 32; /* key length */
+  memcpy (mppe_in + 1, key_mat, 32);
+  mppe_encrypt(mppe_attr + 6, auth, key, key_len,
+	       mppe_in, sizeof mppe_in, mppe_attr + 8);
+
+  app_radius_attr(rep, off, ATTR_VENDOR_SPECIFIC, mppe_attr, sizeof mppe_attr);
 }
 
 static int
@@ -1110,13 +1297,13 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       req[2] = 0;
       req[3] = 5;
       req[4] = EAP_TYPE_IDENTITY;
-      printf ("#SSL send eap:\n");
+      printf ("#SSL send eap (init):\n");
       dump_hex (" ", req, sizeof req);
       dump_eap_message(req, sizeof req);
 #else
       unsigned char req[1];
       req[0] = EAP_TYPE_IDENTITY;
-      printf ("#SSL send eap:\n");
+      printf ("#SSL send eap (init):\n");
       dump_hex (" ", req, sizeof req);
       dump_eap_request(req, sizeof req);
 #endif
@@ -1132,7 +1319,8 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 
     len = SSL_read(s->ssl, pkt->rep, sizeof pkt->rep);
     if (len < 0) {
-      printf ("SSL read error\n");
+      printf ("SSL read error: len=%d, err=%d\n",
+	      len, SSL_get_error(s->ssl, len));
       return -1;
     }
     else {
@@ -1141,6 +1329,13 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       dump_eap_response(pkt->rep, len);
 
       if (pkt->rep[0] == EAP_TYPE_IDENTITY) {
+	/* Copy user name.
+	   TODO: check length.
+	 */
+	{
+	  s->user_name[0] = len - 1;
+	  memcpy(s->user_name + 1, pkt->rep + 1, len - 1);
+	}
 #if 0
 	unsigned char rsp[20];
 	rsp[0] = EAP_CODE_REQUEST;
@@ -1193,8 +1388,25 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	/* Send EAP-success */
 	unsigned char rsp[4];
 	unsigned off;
+	/* Keying material.  */
+	unsigned char key_mat[128];
+	static char label[] = "client EAP encryption"; /* RFC 5216 2.3 */
+
 	app_radius_hdr(pkt->rep, &off,
 		       CODE_ACCESS_ACCEPT, s->rad_id, pkt->req + 4);
+	app_radius_attr(pkt->rep, &off,
+			ATTR_USER_NAME, s->user_name + 1, s->user_name[0]);
+
+	if (SSL_export_keying_material(s->ssl, key_mat, sizeof (key_mat),
+				       label, sizeof(label) - 1,
+				       NULL, 0, 0) != 1) {
+	  printf ("SSL_export keying error\n");
+	  return -1;
+	}
+
+	/* Encrypt recv and send keys.  RFC 2548 2.4.2 */
+	app_radius_mppe(pkt->rep, &off, 0x11, key_mat, pkt->req + 4);
+	app_radius_mppe(pkt->rep, &off, 0x10, key_mat + 32, pkt->req + 4);
 
 	rsp[0] = EAP_CODE_SUCCESS;
 	rsp[1] = s->last_id + 1;
@@ -1363,7 +1575,7 @@ handle_access_request(struct udp_addr *pkt)
     off += pkt->req[off + 1];
   }
   if (eap_len != 0) {
-    printf ("EAP message(2) len=%u:\n", eap_len);
+    printf ("EAP message(concat) len=%u:\n", eap_len);
     dump_eap_message(eap_buf, eap_len);
     return handle_eap_message(pkt, state, eap_buf, eap_len);
   }
