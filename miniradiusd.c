@@ -28,9 +28,9 @@
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/md5.h>
 
 #include "hmac_md5.h"
-#include "md5.h"
 #include "radius.h"
 #include "dump.h"
 
@@ -154,7 +154,7 @@ static unsigned int
 compute_eap_authenticator_noalloc (unsigned char *rep, unsigned int len,
 				   unsigned char *p_mac)
 {
-  struct MD5Context md5_ctxt;
+  MD5_CTX md5_ctxt;
 
   /* RADIUS packet length.  */
   rep[3] = len & 0xff;
@@ -192,10 +192,10 @@ compute_eap_authenticator_noalloc (unsigned char *rep, unsigned int len,
 
      ResponseAuth =  MD5(Code+ID+Length+RequestAuth+Attributes+Secret)
        where + denotes concatenation.  */
-  MD5Init (&md5_ctxt);
-  MD5Update (&md5_ctxt, rep, len);
-  MD5Update (&md5_ctxt, secret, secret_len);
-  MD5Final (rep + 4, &md5_ctxt);
+  MD5_Init (&md5_ctxt);
+  MD5_Update (&md5_ctxt, rep, len);
+  MD5_Update (&md5_ctxt, secret, secret_len);
+  MD5_Final (rep + 4, &md5_ctxt);
 
   return len;
 }
@@ -468,19 +468,19 @@ mppe_encrypt (const unsigned char *salt,
 {
   unsigned i;
   for (i = 0; i < key_len; i += 16) {
-    struct MD5Context md5_ctxt;
+    MD5_CTX md5_ctxt;
     unsigned char b[16];
     unsigned j;
 
-    MD5Init (&md5_ctxt);
-    MD5Update (&md5_ctxt, secret, secret_len);
+    MD5_Init (&md5_ctxt);
+    MD5_Update (&md5_ctxt, secret, secret_len);
     if (i == 0) {
-      MD5Update (&md5_ctxt, auth, 16);
-      MD5Update (&md5_ctxt, salt, 2);
+      MD5_Update (&md5_ctxt, auth, 16);
+      MD5_Update (&md5_ctxt, salt, 2);
     }
     else
-      MD5Update (&md5_ctxt, out + i - 16, 16);
-    MD5Final (b, &md5_ctxt);
+      MD5_Update (&md5_ctxt, out + i - 16, 16);
+    MD5_Final (b, &md5_ctxt);
 
     for (j = 0; j < 16; j++) {
       unsigned char p;
