@@ -24,6 +24,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <time.h>
 #include <assert.h>
 
 #include <openssl/rand.h>
@@ -774,13 +775,53 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 
 	if (memcmp (challenge, pkt->rep + 2, sizeof challenge) == 0) {
 	  s->success = 1;
-	  log_info("user %s accepted\n", s->user->name);
 	}
 	else
 	  log_err("Recv-Challenge: failure due to mismatch\n");
       }
       else {
 	log_err("Recv-Challenge: failure due to unknown user\n");
+      }
+
+      /* Log */
+      {
+	static const char wday_name[12][4] = {
+	  "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
+	};
+	static const char mon_name[12][4] = {
+	  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+	  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+	};
+	time_t t;
+	struct tm tm;
+
+	if (time(&t) == (time_t)-1)
+	  t = 0;
+
+	/* If the time is obviously wrong, don't try to convert it to
+	   local time.  */
+	if (t > (time_t)(24 * 3600 * 365 * 20))
+	  localtime_r(&t, &tm);
+	else
+	  gmtime_r(&t, &tm);
+
+#if 0
+	asctime_r(&tm, tbuf);
+
+	/* The output of asctime is a string of the form:
+	     Thu Nov 24 18:22:48 1986\n\0
+	*/
+	assert(tbuf[26] == 0);
+	assert(tbuf[25] == '\n');
+	tbuf[25] = 0;
+#endif
+
+	log_info("%s %s %2d %02d:%02d:%02d %d: user %s %s\n",
+		 wday_name[tm.tm_wday], mon_name[tm.tm_mon],
+		 tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+		 1900 + tm.tm_year,
+		 s->user ? s->user->name : "(unknown)",
+		 s->success ? "accepted" : "rejected");
       }
 
       /* Result.  */
@@ -838,6 +879,8 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       }
 
       if (s->success) {
+	unsigned char timeout[4];
+
 	if (SSL_export_keying_material(s->ssl, key_mat, sizeof (key_mat),
 				       label, sizeof(label) - 1,
 				       NULL, 0, 0) != 1) {
@@ -848,6 +891,10 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	/* Encrypt recv and send keys.  RFC 2548 2.4.2 */
 	app_radius_mppe(pkt->rep, &off, 0x11, key_mat, pkt->req + 4);
 	app_radius_mppe(pkt->rep, &off, 0x10, key_mat + 32, pkt->req + 4);
+
+	write32(timeout, 5 * 60);
+	app_radius_attr(pkt->rep, &off, ATTR_SESSION_TIMEOUT,
+			timeout, sizeof timeout);
       }
 
       rsp[0] = s->success ? EAP_CODE_SUCCESS : EAP_CODE_FAILURE;
