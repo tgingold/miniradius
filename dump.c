@@ -673,7 +673,7 @@ dump_pcap(void)
     flen = buf[12] | (buf[13] << 8) | (buf[14] << 16) | (buf[15] << 24);
 
     len = read(0, buf, plen);
-    if (len != plen) {
+    if ((unsigned)len != plen) {
       perror("read pkt");
       return 1;
     }
@@ -713,9 +713,9 @@ dump_pcap(void)
     }
 
     hlen += 4 * (buf[hlen] & 0x0f);
-    if (((buf[hlen + 0] << 8) | buf[hlen + 1]) == port)
+    if (read16(buf + hlen) == port)
       printf (" from server\n");
-    else if (((buf[hlen + 2] << 8) | buf[hlen + 3]) == port)
+    else if (read16(buf + hlen + 2) == port)
       printf (" to server\n");
     else {
       printf (" not radius port (hlen=%u, port=%04x)\n", hlen, port);

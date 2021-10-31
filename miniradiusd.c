@@ -54,7 +54,7 @@ static SSL_CTX *ssl_ctxt;
 
 struct udp_addr {
   unsigned fd;
-  struct sockaddr caddr;
+  struct sockaddr_in caddr;
 
   unsigned char req[BUF_LEN];
   unsigned char rep[BUF_LEN];
@@ -161,7 +161,7 @@ log_info(const char *msg, ...)
 /* Check authenticator attribute.
    Return 1 if OK, -1 if error, 0 if not present.  */
 static int
-auth_request(unsigned char *p, int plen)
+auth_request(unsigned char *p, unsigned plen)
 {
   unsigned off;
 
@@ -346,7 +346,7 @@ do_eap_init(struct udp_addr *pkt,
   }
 
   /* Fill the context. */
-  memcpy (&ctxt->peer_addr, &pkt->caddr, pkt->caddr.sa_len);
+  memcpy (&ctxt->peer_addr, &pkt->caddr, sizeof pkt->caddr);
   ctxt->rad_id = pkt->req[1];
   ctxt->last_id = req[1] + 1;
 
@@ -563,7 +563,7 @@ do_eap_tun_in(struct udp_addr *pkt, struct eap_ctxt *s,
       reqlen -= 6;
     }
 
-    if (BIO_write(s->mem_rd, req, reqlen) != reqlen) {
+    if (BIO_write(s->mem_rd, req, reqlen) != (int)reqlen) {
       printf ("BIO_write error\n");
       return -1;
     }
@@ -623,7 +623,7 @@ do_eap_tun_out(struct udp_addr *pkt, struct eap_ctxt *s,
     rsp[2] = 0;       /* len */
     rsp[3] = 0;
     rsp[4] = EAP_TYPE_PEAP;
-    rsp[5] = PEAP_FLAG_LEN | (len < s->total_len ? PEAP_FLAG_MORE : 0);
+    rsp[5] = PEAP_FLAG_LEN | ((unsigned)len < s->total_len ? PEAP_FLAG_MORE : 0);
     write32(rsp + 6, s->total_len);
     app_radius_peap(pkt->rep, &off, rsp, sizeof rsp, b, len);
 
@@ -659,7 +659,7 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	    unsigned char *req, unsigned reqlen)
 {
   int res;
-  int len;
+  int len = 0;
 
   /* Handle only PEAP.  */
   if (req[4] != EAP_TYPE_PEAP) {
@@ -1102,7 +1102,7 @@ server(unsigned flag_write)
 {
   int sock;
   struct sockaddr_in myaddr;
-  int bin_log;
+  int bin_log = -1;
 
   ssl_ctxt = init_openssl();
   if (ssl_ctxt == NULL)
@@ -1141,7 +1141,8 @@ server(unsigned flag_write)
     uaddr.fd = sock;
     alen = sizeof(uaddr.caddr);
 
-    r = recvfrom(sock, uaddr.req, sizeof uaddr.req, 0, &uaddr.caddr, &alen);
+    r = recvfrom(sock, uaddr.req, sizeof uaddr.req, 0,
+                 (struct sockaddr *)&uaddr.caddr, &alen);
     if (r < 0) {
       if (errno == EAGAIN)
 	continue;
@@ -1150,11 +1151,9 @@ server(unsigned flag_write)
     }
 
     if (flag_dump) {
-      if (uaddr.caddr.sa_family == AF_INET) {
-	struct sockaddr_in *sin = (struct sockaddr_in *)&uaddr.caddr;
-	printf ("### from: %s port %u, len: %u\n",
-		inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), r);
-      }
+      struct sockaddr_in *sin = (struct sockaddr_in *)&uaddr.caddr;
+      printf ("### from: %s port %u, len: %u\n",
+	      inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), r);
       dump_radius(uaddr.req, r);
     }
 
@@ -1185,18 +1184,17 @@ server(unsigned flag_write)
 
     /* Send reply. */
     if (flag_dump) {
-      if (uaddr.caddr.sa_family == AF_INET) {
-	struct sockaddr_in *sin = (struct sockaddr_in *)&uaddr.caddr;
-	printf ("### to: %s port %u, len: %u\n",
-		inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), res);
-      }
+      struct sockaddr_in *sin = (struct sockaddr_in *)&uaddr.caddr;
+      printf ("### to: %s port %u, len: %u\n",
+              inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), res);
       dump_radius(uaddr.rep, res);
     }
 
     if (flag_write)
       write(bin_log, uaddr.rep, res);
 
-    r = sendto (sock, uaddr.rep, res, 0, &uaddr.caddr, uaddr.caddr.sa_len);
+    r = sendto (sock, uaddr.rep, res, 0,
+                (struct sockaddr *)&uaddr.caddr, sizeof uaddr.caddr);
     if (r != res)
       perror ("sendto");
   }
