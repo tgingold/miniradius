@@ -1,0 +1,46 @@
+include ../common.mak
+
+CFLAGS = -Os -Wall $(EXTRACFLAGS) -Wsign-compare
+CFLAGS += -I$(SRCBASE) -I$(SRCBASE)/include -I. -I$(TOP)/shared
+
+OBJS = miniradiusd.o dump.o hmac_md5.o users-static.o
+
+LIBS = -L$(TOP)/nvram -lnvram -L$(TOP)/shared -lshared -lpthread
+
+ifeq ($(TCONFIG_OPENSSL11),y)
+CFLAGS += -I$(TOP)/openssl-1.1/include
+LIBS += -L$(TOP)/openssl-1.1 -lssl -lcrypto
+else
+CFLAGS += -I$(TOP)/openssl/include
+LIBS += -L$(TOP)/openssl -lssl -lcrypto
+endif
+
+all: miniradiusd
+
+miniradiusd: $(OBJS)
+	@echo " [miniradiusd] CC $@"
+	@$(CC) -o $@ $(OBJS) $(LIBS)
+
+	$(SIZECHECK)
+	$(CPTMP)
+
+install:
+	@echo " [miniradiusd] Installing to $(INSTALLDIR)"
+	@install -D miniradiusd $(INSTALLDIR)/usr/sbin/miniradiusd
+	@$(STRIP) $(INSTALLDIR)/usr/sbin/miniradiusd
+	@chmod 0500 $(INSTALLDIR)/usr/sbin/miniradiusd
+
+clean:
+	rm -f miniradiusd *.o .*.depend
+
+size: miniradiusd
+	mipsel-uclibc-nm --print-size --size-sort miniradiusd
+
+%.o: %.c .%.depend
+	@echo " [miniradiusd] CC $@"
+	@$(CC) $(CFLAGS) -o $@ -c $<
+
+.%.depend: %.c
+	@$(CC) $(CFLAGS) -M $< > $@
+
+-include $(OBJS:%.o=.%.depend)
