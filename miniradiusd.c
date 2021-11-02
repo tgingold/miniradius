@@ -1083,16 +1083,8 @@ init_openssl(void)
 
   SSL_CTX_set_ecdh_auto(ctx, 1);
 
-  /* Set the key and cert */
-  if (SSL_CTX_use_certificate_file(ctx, "cert.pem", SSL_FILETYPE_PEM) <= 0) {
-    ERR_print_errors_fp(stderr);
+  if (config_ssl(ctx) < 0)
     return NULL;
-  }
-
-  if (SSL_CTX_use_PrivateKey_file(ctx, "key.pem", SSL_FILETYPE_PEM) <= 0 ) {
-    ERR_print_errors_fp(stderr);
-    return NULL;
-  }
 
   return ctx;
 }
@@ -1206,6 +1198,11 @@ main (int argc, char *argv[])
   const char *progname = argv[0];
   unsigned flag_dump_pcap = 0;
   unsigned flag_write = 0;
+
+  if (config_init() < 0) {
+    log_err("failed to initialize configuration\n");
+    return 1;
+  }
 
   /* Skip progname. */
   argv++;
