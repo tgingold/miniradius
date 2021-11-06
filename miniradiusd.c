@@ -34,7 +34,7 @@
 
 #include "hmac_md5.h"
 #include "radius.h"
-#include "users.h"
+#include "config.h"
 #include "dump.h"
 
 /* If True, dump packets on stdout.  */

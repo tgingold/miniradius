@@ -3,7 +3,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-#include "users.h"
+#include "config.h"
 
 #define NBR_USERS 2
 static struct user users[NBR_USERS] = {

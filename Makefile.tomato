@@ -3,7 +3,7 @@ include ../common.mak
 CFLAGS = -Os -Wall $(EXTRACFLAGS) -Wsign-compare
 CFLAGS += -I$(SRCBASE) -I$(SRCBASE)/include -I. -I$(TOP)/shared
 
-OBJS = miniradiusd.o dump.o hmac_md5.o users-static.o
+OBJS = miniradiusd.o dump.o hmac_md5.o config-tomato.o
 
 LIBS = -L$(TOP)/nvram -lnvram -L$(TOP)/shared -lshared -lpthread
 
