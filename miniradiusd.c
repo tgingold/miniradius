@@ -991,19 +991,7 @@ handle_access_request(struct udp_addr *pkt)
   unsigned char eap_buf[4096];
   unsigned eap_len = 0;
   unsigned char *state;
-  int auth;
   unsigned off;
-
-  /* Authenticate. */
-  auth = auth_request(pkt->req, pkt->reqlen);
-  if (auth < 0) {
-    log_err ("Authentification failed\n");
-    return -1;
-  }
-  else if (auth == 0) {
-    log_err ("Non authentified packet\n");
-    return -1;
-  }
 
   /* Find and gather EAP-Message, find State.  */
   eap_len = 0;
@@ -1019,11 +1007,26 @@ handle_access_request(struct udp_addr *pkt)
       state = pkt->req + off;
     off += pkt->req[off + 1];
   }
+
   if (eap_len != 0) {
+    int auth;
+
     if (flag_dump) {
       printf ("EAP message(concat) len=%u:\n", eap_len);
       dump_eap_message(eap_buf, eap_len);
     }
+
+    /* Authenticate. */
+    auth = auth_request(pkt->req, pkt->reqlen);
+    if (auth < 0) {
+      log_err ("Authentification failed\n");
+      return -1;
+    }
+    else if (auth == 0) {
+      log_err ("Non authentified packet\n");
+      return -1;
+    }
+
     return handle_eap_message(pkt, state, eap_buf, eap_len);
   }
   else {
