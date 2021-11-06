@@ -1,3 +1,7 @@
+/* Radius shared secret between this server and the clients.  */
+extern unsigned char *secret;
+extern unsigned secret_len;
+
 struct user {
   const char *name;
   const char *pass;

@@ -44,8 +44,8 @@ static unsigned flag_dump = 0;
 unsigned port = 1812;
 
 /* Radius shared secret between this server and the clients.  */
-static unsigned char *secret;
-static unsigned secret_len;
+unsigned char *secret;
+unsigned secret_len;
 
 static SSL_CTX *ssl_ctxt;
 
@@ -140,7 +140,7 @@ write32 (unsigned char *p, uint32_t v)
   p[3] = v >> 0;
 }
 
-static void
+void
 log_err(const char *msg, ...)
 {
   va_list args;
@@ -149,7 +149,7 @@ log_err(const char *msg, ...)
   va_end(args);
 }
 
-static void
+void
 log_info(const char *msg, ...)
 {
   va_list args;
