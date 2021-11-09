@@ -1202,7 +1202,7 @@ main (int argc, char *argv[])
   unsigned flag_dump_pcap = 0;
   unsigned flag_write = 0;
 
-  if (config_init() < 0) {
+  if (config_init(argc, argv) < 0) {
     log_err("failed to initialize configuration\n");
     return 1;
   }

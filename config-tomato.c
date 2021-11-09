@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -102,11 +103,21 @@ int config_ssl(SSL_CTX *ctx)
   return 0;
 }
 
-int config_init(void)
+int config_init(int argc, char **argv)
 {
+  static const char alt_prog[] = "/tmp/miniradiusd";
   char *s;
   char *p;
   char *usr;
+
+  if (strcmp (argv[0], alt_prog) != 0
+      && access(alt_prog, X_OK) == 0) {
+    /* If there is an exec in /tmp, run it.  */
+    log_info("Re-exec %s\n", alt_prog);
+    argv[0] = (char *)alt_prog;
+    execv(alt_prog, argv);
+    return -1;
+  }
 
   nvram_init(NULL);
 

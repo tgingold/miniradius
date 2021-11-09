@@ -9,5 +9,8 @@ struct user {
 
 struct user *get_user(const unsigned char *name, unsigned name_len);
 
-int config_init(void);
+int config_init(int argc, char **argv);
 int config_ssl(SSL_CTX *ctx);
+
+void log_info(const char *msg, ...);
+void log_err(const char *msg, ...);

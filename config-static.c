@@ -44,7 +44,7 @@ int config_ssl(SSL_CTX *ctx)
   return 0;
 }
 
-int config_init(void)
+int config_init(int argc, char **argv)
 {
   return 0;
 }
