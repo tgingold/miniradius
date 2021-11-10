@@ -11,6 +11,24 @@ static struct user users[NBR_USERS] = {
   { "user2", "pass2" }
 };
 
+void
+log_err(const char *msg, ...)
+{
+  va_list args;
+  va_start(args, msg);
+  vfprintf (stderr, msg, args);
+  va_end(args);
+}
+
+void
+log_info(const char *msg, ...)
+{
+  va_list args;
+  va_start(args, msg);
+  vfprintf (stderr, msg, args);
+  va_end(args);
+}
+
 struct user *
 get_user(const unsigned char *name, unsigned name_len)
 {

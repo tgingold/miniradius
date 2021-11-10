@@ -1,3 +1,5 @@
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <string.h>
 #include <unistd.h>
@@ -8,12 +10,40 @@
 #include "config.h"
 #include "bcmnvram.h"
 
+#define USER_FILE "/etc/miniradiusd.conf"
+#define LOG_FILE "/var/log/miniradiusd.log"
+
+static FILE *log_file;
+
 #define MAX_USERS 16
 static unsigned nbr_users;
 static struct user users[MAX_USERS];
 
-struct user *
-get_user(const unsigned char *name, unsigned name_len)
+static time_t user_file_mtime;
+
+void
+log_err(const char *msg, ...)
+{
+  va_list args;
+  va_start(args, msg);
+  vfprintf (log_file, msg, args);
+  fflush (log_file);
+  va_end(args);
+}
+
+void
+log_info(const char *msg, ...)
+{
+  va_list args;
+  va_start(args, msg);
+  vfprintf (log_file, msg, args);
+  fflush (log_file);
+  va_end(args);
+}
+
+/* Find a user in the table.  Linear.  */
+static struct user *
+find_user(const unsigned char *name, unsigned name_len)
 {
   unsigned i;
 
@@ -31,6 +61,96 @@ get_user(const unsigned char *name, unsigned name_len)
       return u;
   }
   return NULL;
+}
+
+/* Read and parse the users file (if it has changed).  */
+static void
+read_users_file (void)
+{
+  struct stat statb;
+  int fd;
+  char *buf;
+  unsigned len;
+  char *u;
+
+  if (stat (USER_FILE, &statb) < 0) {
+    if (errno == ENOENT)
+      return;
+    log_err("cannot stat conf file\n");
+    return;
+  }
+
+  if (statb.st_mtime == user_file_mtime) {
+    /* No change.  */
+    return;
+  }
+  len = (unsigned)statb.st_size;
+  buf = malloc (len + 1);
+  if (buf == NULL) {
+    log_err ("memory exhausted\n");
+    return;
+  }
+  fd = open (USER_FILE, O_RDONLY);
+  if (fd < 0) {
+    log_err ("cannot open conf file\n");
+    return;
+  }
+  if (read (fd, buf, len) != (int)len) {
+    log_err ("failed to read conf file\n");
+    close (fd);
+    return;
+  }
+  close (fd);
+  buf[len] = 0;
+
+  /* Parse the file.  */
+  for (u = buf; *u; ) {
+    struct user *usr;
+    unsigned t;
+    char *s;
+    char *e;
+
+    /* Skip spaces.  */
+    while (*u == ' ')
+      u++;
+    /* Until ':'.  */
+    for (s = u; *s; s++)
+      if (*s == ':')
+	break;
+    if (*s != ':')
+      goto parse_error;
+    *s = 0;
+
+    /* Find user.  */
+    usr = find_user ((unsigned char *)u, (unsigned)(s - u));
+
+    t = strtoul (s + 1, &e, 10);
+    if (e == s + 1 || (*e != ' ' && *e != 0))
+      goto parse_error;
+
+    if (usr)
+      usr->timeout = t;
+    else
+      log_err ("conf file: unknown user %s\n", u);
+
+    u = s;
+  }
+  free (buf);
+  return;
+
+ parse_error:
+  log_err ("conf file error\n");
+  free (buf);
+  return;
+}
+
+struct user *
+get_user(const unsigned char *name, unsigned name_len)
+{
+  /* Maybe reload users file.  */
+  read_users_file ();
+
+  return find_user (name, name_len);
 }
 
 static int config_cert(SSL_CTX *ctx)
@@ -113,13 +233,18 @@ int config_init(int argc, char **argv)
   if (strcmp (argv[0], alt_prog) != 0
       && access(alt_prog, X_OK) == 0) {
     /* If there is an exec in /tmp, run it.  */
-    log_info("Re-exec %s\n", alt_prog);
     argv[0] = (char *)alt_prog;
     execv(alt_prog, argv);
     return -1;
   }
 
   nvram_init(NULL);
+
+  /* Open log file */
+  rename(LOG_FILE, LOG_FILE ".old");
+  log_file = fopen (LOG_FILE, "w");
+  if (log_file == NULL)
+    return -1;
 
   /* Check enabled.  */
   s = nvram_get("miniradiusd_en");
@@ -128,14 +253,16 @@ int config_init(int argc, char **argv)
     return -1;
   }
 
+  user_file_mtime = 0;
+
   /* Radius secret.  */
   s = nvram_get("miniradiusd_secret");
   if (s == NULL || s[0] == 0) {
     log_err("miniradiusd secret not set\n");
     return -1;
   }
-  secret = strdup(s);
-  secret_len = strlen(secret);
+  secret = (unsigned char *)strdup(s);
+  secret_len = strlen((char *)secret);
 
   /* Users.  */
   s = nvram_get("miniradiusd_users");

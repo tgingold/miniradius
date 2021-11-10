@@ -24,6 +24,9 @@ extern unsigned port;
 /* If true, dump only the EAP messages of radius packets.  */
 extern unsigned dump_eap_only;
 
+/* Write a string to the dump output.  */
+void dump_log(const char *fmt, ...);
+
 /* Read and dump pcap packets from stdin.  */
 int dump_pcap(void);
 

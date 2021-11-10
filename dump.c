@@ -15,6 +15,7 @@
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -35,6 +36,15 @@ static uint32_t
 read24 (const unsigned char *p)
 {
   return (p[0] << 16) | (p[1] << 8) | p[2];
+}
+
+void
+dump_log(const char *fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+  vfprintf (stdout, fmt, args);
+  va_end(args);
 }
 
 void

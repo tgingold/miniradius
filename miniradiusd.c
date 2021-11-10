@@ -52,8 +52,9 @@ static SSL_CTX *ssl_ctxt;
 #define BUF_LEN 4096
 #define MTU 1024
 
-struct udp_addr {
+struct udp_pkt {
   unsigned fd;
+  time_t cur_time;
   struct sockaddr_in caddr;
 
   unsigned char req[BUF_LEN];
@@ -64,6 +65,7 @@ struct udp_addr {
 
 struct eap_ctxt {
   struct sockaddr peer_addr;
+  time_t last_time;
   uint16_t mtu;
   uint8_t rad_id;
 
@@ -72,11 +74,7 @@ struct eap_ctxt {
   /* Radius-State */
   unsigned char radius_state[4];
 
-  /* State:
-     0: unused
-     1: init tls sent (protocol, list of protocol)
-     2: in TLS handshake
-  */
+  /* State */
   enum eap_state {
     S_FREE,
     S_INIT,
@@ -109,6 +107,9 @@ struct eap_ctxt {
   struct user *user;
 };
 
+/* Number of seconds from the last received packet.  */
+#define CTXT_TIMEOUT 10
+
 #define NBR_EAP_CTXTS 8
 static struct eap_ctxt eap_ctxts[NBR_EAP_CTXTS];
 
@@ -138,24 +139,6 @@ write32 (unsigned char *p, uint32_t v)
   p[1] = v >> 16;
   p[2] = v >> 8;
   p[3] = v >> 0;
-}
-
-void
-log_err(const char *msg, ...)
-{
-  va_list args;
-  va_start(args, msg);
-  vfprintf (stderr, msg, args);
-  va_end(args);
-}
-
-void
-log_info(const char *msg, ...)
-{
-  va_list args;
-  va_start(args, msg);
-  vfprintf (stderr, msg, args);
-  va_end(args);
 }
 
 /* Check authenticator attribute.
@@ -322,8 +305,9 @@ app_radius_peap(unsigned char *rep, unsigned *off,
   }
 }
 
+/* Handle the first EAP packet.  */
 static int
-do_eap_init(struct udp_addr *pkt,
+do_eap_init(struct udp_pkt *pkt,
 	    unsigned char *req, unsigned reqlen)
 {
   struct eap_ctxt *ctxt;
@@ -331,17 +315,24 @@ do_eap_init(struct udp_addr *pkt,
   unsigned off;
   unsigned i;
 
-  /* Find a free context.  */
+  /* Find a free context.  Linear. */
   ctxt = NULL;
-  for (i = 0; i < NBR_EAP_CTXTS; i++)
-    if (eap_ctxts[i].state == S_FREE) {
-      ctxt = &eap_ctxts[i];
+  for (i = 0; i < NBR_EAP_CTXTS; i++) {
+    ctxt = &eap_ctxts[i];
+    if (ctxt->last_time + CTXT_TIMEOUT <= pkt->cur_time) {
+      /* Can free the context.  */
+      SSL_free (ctxt->ssl);
+      memset (ctxt, 0, sizeof *ctxt);
+    }
+    if (ctxt->state == S_FREE) {
       ctxt->state = S_INIT;
       ctxt->radius_state[0] = i;
       break;
     }
+    ctxt = NULL;
+  }
   if (ctxt == NULL) {
-    printf ("No context available\n");
+    log_err ("No EAP context available\n");
     return -1;
   }
 
@@ -349,6 +340,7 @@ do_eap_init(struct udp_addr *pkt,
   memcpy (&ctxt->peer_addr, &pkt->caddr, sizeof pkt->caddr);
   ctxt->rad_id = pkt->req[1];
   ctxt->last_id = req[1] + 1;
+  ctxt->last_time = pkt->cur_time;
 
   /* Prepare the response: start TLS.  */
   app_radius_hdr(pkt->rep, &off,
@@ -438,7 +430,7 @@ BIO_discard(BIO *bio, unsigned len)
 }
 
 static int
-do_eap_tun_in(struct udp_addr *pkt, struct eap_ctxt *s,
+do_eap_tun_in(struct udp_pkt *pkt, struct eap_ctxt *s,
 	      unsigned char *req, unsigned reqlen)
 {
   unsigned char eap_id;
@@ -448,7 +440,19 @@ do_eap_tun_in(struct udp_addr *pkt, struct eap_ctxt *s,
   if (s->state == S_INIT) {
     s->mem_rd = BIO_new(BIO_s_mem());
     s->mem_wr = BIO_new(BIO_s_mem());
+    if (s->mem_rd == NULL || s->mem_wr == NULL) {
+      log_err("cannot allocate BIO\n");
+      BIO_free(s->mem_rd);
+      BIO_free(s->mem_wr);
+      return -1;
+    }
     s->ssl = SSL_new(ssl_ctxt);
+    if (s->ssl == NULL) {
+      log_err("cannot allocate SSL\n");
+      BIO_free(s->mem_rd);
+      BIO_free(s->mem_wr);
+      return -1;
+    }
     SSL_set_bio(s->ssl, s->mem_rd, s->mem_wr);
     s->state = S_HANDSHAKE;
     s->rx_tx = 1;
@@ -476,11 +480,11 @@ do_eap_tun_in(struct udp_addr *pkt, struct eap_ctxt *s,
 
     if (s->rx_tx != 1) {
       /* Was not transmitting, or packet fully transmitted.  */
-      printf ("Unexpected ACK\n");
+      log_err ("Unexpected ACK\n");
       return -1;
     }
     if (s->last_id != eap_id) {
-      printf ("ACK for an unknown packet\n");
+      log_err ("ACK for an unknown packet\n");
       return -1;
     }
     /* ACK.  Discard bytes, send the next packet.  */
@@ -489,9 +493,9 @@ do_eap_tun_in(struct udp_addr *pkt, struct eap_ctxt *s,
 
     len = BIO_get_mem_data(s->mem_wr, (char **)&b);
     if (flag_dump)
-      printf ("### ack - total: %u, cur: %u, rem: %u, bio len: %u\n",
-	      s->total_len, s->cur_len, s->total_len - s->cur_len,
-	      (unsigned)len);
+      dump_log ("### ack - total: %u, cur: %u, rem: %u, bio len: %u\n",
+		s->total_len, s->cur_len, s->total_len - s->cur_len,
+		(unsigned)len);
     if (len == 0) {
       assert (s->cur_len == s->total_len);
     }
@@ -526,7 +530,7 @@ do_eap_tun_in(struct udp_addr *pkt, struct eap_ctxt *s,
        - Or a new fragment (with or without the MORE flag)
     */
     if (s->rx_tx != 1) {
-      printf ("Unexpected data - need to transmit\n");
+      log_err ("Unexpected data - need to transmit\n");
       return -1;
     }
     /* TODO: retransmission of the last packet. */
@@ -556,7 +560,7 @@ do_eap_tun_in(struct udp_addr *pkt, struct eap_ctxt *s,
     else {
       /* A fragment  */
       if (pflags & PEAP_FLAG_LEN) {
-	printf ("PEAP: unexpected LEN flag\n");
+	log_err ("PEAP: unexpected LEN flag\n");
 	return -1;
       }
       req += 6;
@@ -564,13 +568,13 @@ do_eap_tun_in(struct udp_addr *pkt, struct eap_ctxt *s,
     }
 
     if (BIO_write(s->mem_rd, req, reqlen) != (int)reqlen) {
-      printf ("BIO_write error\n");
+      log_err ("BIO_write error\n");
       return -1;
     }
 
     assert(s->rx_tx == 0);
     if (s->cur_len + s->last_len < s->total_len) {
-      printf ("TODO: need to send ACK\n");
+      log_err ("TODO: need to send ACK\n");
       return -1;
     }
   }
@@ -579,14 +583,14 @@ do_eap_tun_in(struct udp_addr *pkt, struct eap_ctxt *s,
     unsigned char *b;
     long len;
     len = BIO_get_mem_data(s->mem_rd, (char **)&b);
-    printf ("TLS: recv %ld bytes\n", len);
+    dump_log ("TLS: recv %ld bytes\n", len);
     dump_tls (b, len);
   }
   return 0;
 }
 
 static int
-do_eap_tun_out(struct udp_addr *pkt, struct eap_ctxt *s,
+do_eap_tun_out(struct udp_pkt *pkt, struct eap_ctxt *s,
 	       unsigned char *req)
 {
   unsigned char *b;
@@ -596,12 +600,12 @@ do_eap_tun_out(struct udp_addr *pkt, struct eap_ctxt *s,
   len = BIO_get_mem_data(s->mem_wr, (char **)&b);
 
   if (flag_dump) {
-    printf ("TLS: send %ld bytes\n", len);
+    dump_log ("TLS: send %ld bytes\n", len);
     dump_tls (b, len);
   }
 
   if (0)
-    printf("BIO get_mem_data: %u\n", (unsigned)len);
+    dump_log ("BIO get_mem_data: %u\n", (unsigned)len);
   if (len != 0) {
     unsigned off;
     unsigned char rsp[10];
@@ -632,7 +636,7 @@ do_eap_tun_out(struct udp_addr *pkt, struct eap_ctxt *s,
 
     return compute_eap_authenticator(pkt->rep, off);
   }
-  printf ("SSL wants to read after rx!\n");
+  log_err ("SSL wants to read after rx!\n");
   return -1;
 }
 
@@ -647,7 +651,7 @@ do_eap_peap_ident(struct eap_ctxt *s)
   req[3] = 5;
   req[4] = EAP_TYPE_IDENTITY;
   if (flag_dump) {
-    printf ("#SSL send eap (identity):\n");
+    dump_log ("#SSL send eap (identity):\n");
     dump_hex (" ", req, sizeof req);
     dump_eap_message(req, sizeof req);
   }
@@ -655,7 +659,7 @@ do_eap_peap_ident(struct eap_ctxt *s)
 }
 
 static int
-do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
+do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
 	    unsigned char *req, unsigned reqlen)
 {
   int res;
@@ -666,6 +670,8 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
     log_err ("Unhandled eap response type (%u)\n", req[4]);
     return -1;
   }
+
+  s->last_time = pkt->cur_time;
 
   res = do_eap_tun_in(pkt, s, req, reqlen);
   if (res != 0)
@@ -680,12 +686,12 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	len = 0;
       }
       else {
-	printf ("SSL read error: len=%d, err=%d\n", len, err);
+	log_err ("SSL read error: len=%d, err=%d\n", len, err);
 	return -1;
       }
     }
     if (flag_dump && len > 0) {
-      printf ("##SSL recv eap:\n");
+      dump_log ("##SSL recv eap:\n");
       dump_hex ("  ", pkt->rep, len);
       dump_eap_response(pkt->rep, len);
     }
@@ -697,7 +703,7 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       res = SSL_accept(s->ssl);
       if (res == 1) {
 	if (0)
-	  printf ("Handshake accepted\n");
+	  dump_log ("Handshake accepted\n");
 
 	if (SSL_version(s->ssl) > TLS1_1_VERSION) {
 	  do_eap_peap_ident(s);
@@ -711,6 +717,10 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       else if (res == 0) {
 	log_err ("Handshake failure\n");
 	return -1;
+      }
+      else {
+	/* Wait for more data.
+	   Send ack.  */
       }
     }
     break;
@@ -738,7 +748,7 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       memcpy (rsp + 2, s->challenge, sizeof s->challenge);  /* value */
       memcpy (rsp + 2 + sizeof s->challenge, "mr", 2);      /* name */
       if (flag_dump) {
-	printf ("SSL send md5 challenge\n");
+	dump_log ("SSL send md5 challenge\n");
 	dump_eap_response(rsp, sizeof rsp);
       }
       SSL_write (s->ssl, rsp, sizeof rsp);
@@ -773,11 +783,12 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	MD5_Update (&md5_ctxt, s->challenge, sizeof s->challenge);
 	MD5_Final (challenge, &md5_ctxt);
 
-	if (memcmp (challenge, pkt->rep + 2, sizeof challenge) == 0) {
-	  s->success = 1;
-	}
-	else
+	if (memcmp (challenge, pkt->rep + 2, sizeof challenge) != 0)
 	  log_err("Recv-Challenge: failure due to mismatch\n");
+	else if (pkt->cur_time >= s->user->timeout)
+	  log_err("Recv-Challenge: failure due to timeout\n");
+	else
+	  s->success = 1;
       }
       else {
 	log_err("Recv-Challenge: failure due to unknown user\n");
@@ -792,18 +803,14 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
 	  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
 	};
-	time_t t;
 	struct tm tm;
-
-	if (time(&t) == (time_t)-1)
-	  t = 0;
 
 	/* If the time is obviously wrong, don't try to convert it to
 	   local time.  */
-	if (t > (time_t)(24 * 3600 * 365 * 20))
-	  localtime_r(&t, &tm);
+	if (pkt->cur_time > (time_t)(24 * 3600 * 365 * 20))
+	  localtime_r(&pkt->cur_time, &tm);
 	else
-	  gmtime_r(&t, &tm);
+	  gmtime_r(&pkt->cur_time, &tm);
 
 #if 0
 	asctime_r(&tm, tbuf);
@@ -836,7 +843,7 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       rsp[9] = 0;  /* result */
       rsp[10] = s->success ? RESULT_SUCCESS : RESULT_FAILURE;
       if (flag_dump) {
-	printf ("SSL send result\n");
+	dump_log ("SSL send result\n");
 	dump_eap_message(rsp, sizeof rsp);
       }
       SSL_write (s->ssl, rsp, sizeof rsp);
@@ -852,7 +859,7 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       unsigned eresult = s->success ? RESULT_SUCCESS : RESULT_FAILURE;
       /* Keying material.  */
       unsigned char key_mat[128];
-      static char label[] = "client EAP encryption"; /* RFC 5216 2.3 */
+      static const char label[] = "client EAP encryption"; /* RFC 5216 2.3 */
 
       if (pkt->rep[0] != EAP_CODE_RESPONSE
 	  || len != 11
@@ -880,11 +887,12 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 
       if (s->success) {
 	unsigned char timeout[4];
+	unsigned t;
 
 	if (SSL_export_keying_material(s->ssl, key_mat, sizeof (key_mat),
 				       label, sizeof(label) - 1,
 				       NULL, 0, 0) != 1) {
-	  printf ("SSL_export keying error\n");
+	  log_err ("SSL_export keying error\n");
 	  return -1;
 	}
 
@@ -892,7 +900,17 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 	app_radius_mppe(pkt->rep, &off, 0x11, key_mat, pkt->req + 4);
 	app_radius_mppe(pkt->rep, &off, 0x10, key_mat + 32, pkt->req + 4);
 
-	write32(timeout, 5 * 60);
+	/* Session timeout.  */
+	if (s->user->timeout <= pkt->cur_time) {
+	  /* Timeout occured during renewval.  */
+	  t = 5;
+	}
+	else {
+	  t = (unsigned)(s->user->timeout - pkt->cur_time);
+	  if (t > 5 * 60)
+	    t = 5 * 60;
+	}
+	write32(timeout, t);
 	app_radius_attr(pkt->rep, &off, ATTR_SESSION_TIMEOUT,
 			timeout, sizeof timeout);
       }
@@ -906,7 +924,7 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
       return compute_eap_authenticator(pkt->rep, off);
     }
   default:
-    printf ("Unhandled SSL state\n");
+    log_err ("Unhandled SSL state\n");
     return -1;
   }
 
@@ -916,7 +934,7 @@ do_eap_peap(struct udp_addr *pkt, struct eap_ctxt *s,
 
 /* Handle incoming eap message. */
 static int
-handle_eap_message(struct udp_addr *pkt, unsigned char *state,
+handle_eap_message(struct udp_pkt *pkt, unsigned char *state,
 		   unsigned char *eap, unsigned eap_len)
 {
   struct eap_ctxt *ctxt;
@@ -986,7 +1004,7 @@ handle_eap_message(struct udp_addr *pkt, unsigned char *state,
 }
 
 static int
-handle_access_request(struct udp_addr *pkt)
+handle_access_request(struct udp_pkt *pkt)
 {
   unsigned char eap_buf[4096];
   unsigned eap_len = 0;
@@ -1012,7 +1030,7 @@ handle_access_request(struct udp_addr *pkt)
     int auth;
 
     if (flag_dump) {
-      printf ("EAP message(concat) len=%u:\n", eap_len);
+      dump_log ("EAP message(concat) len=%u:\n", eap_len);
       dump_eap_message(eap_buf, eap_len);
     }
 
@@ -1037,7 +1055,7 @@ handle_access_request(struct udp_addr *pkt)
 
 /* Check the request PKT is well-formed (attributes length is ok). */
 static int
-check_radius_packet(struct udp_addr *pkt, unsigned plen)
+check_radius_packet(struct udp_pkt *pkt, unsigned plen)
 {
   unsigned off;
 
@@ -1128,16 +1146,16 @@ server(unsigned flag_write)
   }
 
   while (1) {
-    struct udp_addr uaddr;
+    struct udp_pkt upkt;
     socklen_t alen;
     int res;
     int r;
 
-    uaddr.fd = sock;
-    alen = sizeof(uaddr.caddr);
+    upkt.fd = sock;
+    alen = sizeof(upkt.caddr);
 
-    r = recvfrom(sock, uaddr.req, sizeof uaddr.req, 0,
-                 (struct sockaddr *)&uaddr.caddr, &alen);
+    r = recvfrom(sock, upkt.req, sizeof upkt.req, 0,
+                 (struct sockaddr *)&upkt.caddr, &alen);
     if (r < 0) {
       if (errno == EAGAIN)
 	continue;
@@ -1145,29 +1163,34 @@ server(unsigned flag_write)
       return 1;
     }
 
+    if (time (&upkt.cur_time) == (time_t)-1) {
+      log_err("cannot get current_time\n");
+      upkt.cur_time = 0;
+    }
+
     if (flag_dump) {
-      struct sockaddr_in *sin = (struct sockaddr_in *)&uaddr.caddr;
-      printf ("### from: %s port %u, len: %u\n",
-	      inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), r);
-      dump_radius(uaddr.req, r);
+      struct sockaddr_in *sin = (struct sockaddr_in *)&upkt.caddr;
+      dump_log ("### from: %s port %u, len: %u\n",
+		inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), r);
+      dump_radius(upkt.req, r);
     }
 
     /* Discard invalid packets.  */
-    if (check_radius_packet(&uaddr, r) < 0) {
+    if (check_radius_packet(&upkt, r) < 0) {
       log_err ("bad radius packet\n");
       continue;
     }
 
     if (flag_write)
-      write(bin_log, uaddr.req, uaddr.reqlen);
+      write(bin_log, upkt.req, upkt.reqlen);
 
     /* Handle packet.  */
-    switch (uaddr.req[0]) {
+    switch (upkt.req[0]) {
     case CODE_ACCESS_REQUEST:
-      res = handle_access_request(&uaddr);
+      res = handle_access_request(&upkt);
       break;
     default:
-      log_err ("unhandled radius req 0x%02x\n", uaddr.req[0]);
+      log_err ("unhandled radius req 0x%02x\n", upkt.req[0]);
       res = 0;
       break;
     }
@@ -1179,17 +1202,17 @@ server(unsigned flag_write)
 
     /* Send reply. */
     if (flag_dump) {
-      struct sockaddr_in *sin = (struct sockaddr_in *)&uaddr.caddr;
-      printf ("### to: %s port %u, len: %u\n",
-              inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), res);
-      dump_radius(uaddr.rep, res);
+      struct sockaddr_in *sin = (struct sockaddr_in *)&upkt.caddr;
+      dump_log ("### to: %s port %u, len: %u\n",
+		inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), res);
+      dump_radius(upkt.rep, res);
     }
 
     if (flag_write)
-      write(bin_log, uaddr.rep, res);
+      write(bin_log, upkt.rep, res);
 
-    r = sendto (sock, uaddr.rep, res, 0,
-                (struct sockaddr *)&uaddr.caddr, sizeof uaddr.caddr);
+    r = sendto (sock, upkt.rep, res, 0,
+                (struct sockaddr *)&upkt.caddr, sizeof upkt.caddr);
     if (r != res)
       perror ("sendto");
   }
