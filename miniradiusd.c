@@ -31,6 +31,9 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/md5.h>
+#include <openssl/sha.h>
+#include <openssl/md4.h>
+#include <openssl/des.h>
 
 #include "hmac_md5.h"
 #include "radius.h"
@@ -101,6 +104,9 @@ struct eap_ctxt {
   BIO *mem_rd;  /* Data read from client.  */
   BIO *mem_wr;  /* Data to be sent to client.  */
   SSL *ssl;
+
+  /* Protocol for authorization: md5-challenge, ms-chap-v2.  */
+  unsigned char proto_auth;
 
   unsigned char challenge[16];
   unsigned char success;
@@ -341,6 +347,9 @@ do_eap_init(struct udp_pkt *pkt,
   ctxt->rad_id = pkt->req[1];
   ctxt->last_id = req[1] + 1;
   ctxt->last_time = pkt->cur_time;
+
+  /* Default: use md5-challenge. */
+  ctxt->proto_auth = EAP_TYPE_MD5_CHALLENGE;
 
   /* Prepare the response: start TLS.  */
   app_radius_hdr(pkt->rep, &off,
@@ -659,6 +668,172 @@ do_eap_peap_ident(struct eap_ctxt *s)
 }
 
 static int
+do_eap_peap_challenge(struct eap_ctxt *s)
+{
+  switch (s->proto_auth) {
+  case EAP_TYPE_MD5_CHALLENGE:
+    {
+      unsigned char rsp[2 + sizeof s->challenge + 2];
+
+      /* Send Challenge. */
+      rsp[0] = EAP_TYPE_MD5_CHALLENGE;
+      rsp[1] = sizeof s->challenge;  /* value size */
+      RAND_bytes(s->challenge, sizeof s->challenge);
+      memcpy (rsp + 2, s->challenge, sizeof s->challenge);  /* value */
+      memcpy (rsp + 2 + sizeof s->challenge, "mr", 2);      /* name */
+      if (flag_dump) {
+	dump_log ("SSL send challenge\n");
+	dump_eap_response(rsp, sizeof rsp);
+      }
+      SSL_write (s->ssl, rsp, sizeof rsp);
+      return 0;
+    }
+    break;
+  case EAP_TYPE_MS_CHAP_V2:
+    {
+      unsigned char rsp[6 + sizeof s->challenge + 2];
+
+      /* Send Challenge. draft-kamath-pppext-eap-mschapv2-02 */
+      rsp[0] = EAP_TYPE_MS_CHAP_V2;
+      rsp[1] = 1; /* Challenge */
+      rsp[2] = s->last_id;
+      write16(rsp + 3, sizeof rsp);
+      rsp[5] = sizeof s->challenge;  /* value size */
+      RAND_bytes(s->challenge, sizeof s->challenge);
+      memcpy (rsp + 6, s->challenge, sizeof s->challenge);  /* value */
+      memcpy (rsp + 6 + sizeof s->challenge, "mr", 2);      /* name */
+      if (flag_dump) {
+	dump_log ("SSL send ms-chap-v2 challenge\n");
+	dump_eap_response(rsp, sizeof rsp);
+      }
+      SSL_write (s->ssl, rsp, sizeof rsp);
+      return 0;
+    }
+  default:
+    log_err("internal error: unhandled auth method %u (in req)\n",
+	    s->proto_auth);
+    return -1;
+  }
+}
+
+static void
+des_encrypt(const unsigned char clear[8], const unsigned char *key,
+	    unsigned char res[8])
+{
+  unsigned char key64[8];
+  DES_key_schedule sched;
+
+  key64[0] = key[0] | 1;
+  key64[1] = (key[0] << 7) | (key[1] >> 1) | 1;
+  key64[2] = (key[1] << 6) | (key[2] >> 2) | 1;
+  key64[3] = (key[2] << 5) | (key[3] >> 3) | 1;
+  key64[4] = (key[3] << 4) | (key[4] >> 4) | 1;
+  key64[5] = (key[4] << 3) | (key[5] >> 5) | 1;
+  key64[6] = (key[5] << 2) | (key[6] >> 6) | 1;
+  key64[7] = (key[6] << 1) | 1;
+
+  DES_set_odd_parity(&key64);
+  DES_set_key(&key64, &sched);
+
+  DES_ecb_encrypt((DES_cblock *)clear, (DES_cblock *)res, &sched, DES_ENCRYPT);
+}
+
+/* Check response. -1: error, 0: reject, 1: ok */
+static int
+do_eap_peap_challenge_response(struct eap_ctxt *s,
+			       unsigned char *req,
+			       unsigned char *rep, unsigned len)
+{
+  switch (s->proto_auth) {
+  case EAP_TYPE_MD5_CHALLENGE:
+    {
+      /* Check result.
+	 RFC 1994: the response value is the one-way hash calculated over
+	 a stream of octets consisting of the Identifier, followed by
+	 (concatenated with) the "secret", followed by (concatenated with)
+	 the Challenge Value. */
+      if (len < 16 + 2 || rep[1] != 16) {
+	log_err("Recv-Challenge: bad challenge reply length\n");
+	return -1;
+      }
+      if (s->user) {
+	MD5_CTX md5_ctxt;
+	unsigned char challenge[16];
+
+	MD5_Init (&md5_ctxt);
+	MD5_Update (&md5_ctxt, req + 1, 1); /* Identifier */
+	MD5_Update (&md5_ctxt, s->user->pass, strlen (s->user->pass));
+	MD5_Update (&md5_ctxt, s->challenge, sizeof s->challenge);
+	MD5_Final (challenge, &md5_ctxt);
+
+	return memcmp (challenge, rep + 2, sizeof challenge) == 0;
+      }
+      else {
+	return 0;
+      }
+    }
+    break;
+  case EAP_TYPE_MS_CHAP_V2:
+    {
+      if (len < 55
+	  || rep[1] != 2 /* Opcode */
+	  /* || rep[2] != s->last_id  * Id, TODO */
+	  || read16(rep + 3) < 6 + 49 /* ms-length */
+	  || rep[5] != 49 /* Value-size */
+	  || rep[6 + 16 + 8 + 24] != 0  /* Response Flag */
+	  ) {
+	log_err("Recv-Challenge: bad challenge reply length\n");
+	return -1;
+      }
+      if (s->user) {
+	SHA_CTX sha_ctx;
+	unsigned char chall_digest[8];
+	MD4_CTX md4_ctx;
+	unsigned char pass_digest[21];
+	unsigned char resp[24];
+	unsigned char unc[2];
+	const char *u;
+
+	/* RFC 2759 section 8. Pseudocode */
+	/* GenerateNTResponse */
+
+	/* ChallengeHash */
+	SHA1_Init(&sha_ctx);
+	SHA1_Update(&sha_ctx, rep + 6, 16);  /* Peer challenge */
+	SHA1_Update(&sha_ctx, s->challenge, 16); /* Auth challenge */
+	SHA1_Update(&sha_ctx, s->user->name, strlen(s->user->name));
+	SHA1_Final(chall_digest, &sha_ctx);
+
+	/* NtPasswordHash (password is in unicode) */
+	unc[1] = 0;
+	MD4_Init(&md4_ctx);
+	for (u = s->user->pass; *u; u++) {
+	  unc[0] = *u;
+	  MD4_Update(&md4_ctx, unc, 2);
+	}
+	MD4_Final(pass_digest, &md4_ctx);
+
+	/* ChallengeResponse */
+	memset(pass_digest + 16, 0, 5);
+	des_encrypt(chall_digest, pass_digest + 0, resp + 0);
+	des_encrypt(chall_digest, pass_digest + 7, resp + 8);
+	des_encrypt(chall_digest, pass_digest + 14, resp + 16);
+
+	return memcmp(resp, rep + 6 + 24, 24) == 0;
+      }
+      else {
+	return 0;
+      }
+    }
+    break;
+  default:
+    log_err("internal error: unhandled auth method %u (in resp)\n",
+	    s->proto_auth);
+    return -1;
+  }
+}
+
+static int
 do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
 	    unsigned char *req, unsigned reqlen)
 {
@@ -732,8 +907,6 @@ do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
     break;
   case S_TUN_RECV_IDENTITY:
     {
-      unsigned char rsp[2 + sizeof s->challenge + 2];
-
       if (len < 1 || pkt->rep[0] != EAP_TYPE_IDENTITY) {
 	log_err("Recv-Identity: expect identity answer\n");
 	return -1;
@@ -741,113 +914,112 @@ do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
       /* Copy user name. */
       s->user = get_user(pkt->rep + 1, len - 1);
 
-      /* Send Challenge. */
-      rsp[0] = EAP_TYPE_MD5_CHALLENGE;
-      rsp[1] = sizeof s->challenge;  /* value size */
-      RAND_bytes(s->challenge, sizeof s->challenge);
-      memcpy (rsp + 2, s->challenge, sizeof s->challenge);  /* value */
-      memcpy (rsp + 2 + sizeof s->challenge, "mr", 2);      /* name */
-      if (flag_dump) {
-	dump_log ("SSL send md5 challenge\n");
-	dump_eap_response(rsp, sizeof rsp);
-      }
-      SSL_write (s->ssl, rsp, sizeof rsp);
       s->state = S_TUN_RECV_CHALLENGE;
+      if (do_eap_peap_challenge(s) < 0)
+	return -1;
     }
     break;
   case S_TUN_RECV_CHALLENGE:
     {
       unsigned char rsp[11];
-      MD5_CTX md5_ctxt;
 
-      if (len < 1 || pkt->rep[0] != EAP_TYPE_MD5_CHALLENGE) {
-	log_err("Recv-Challenge: expect challenge\n");
-	return -1;
-      }
-      /* Check result.
-	 RFC 1994: the response value is the one-way hash calculated over
-	 a stream of octets consisting of the Identifier, followed by
-	 (concatenated with) the "secret", followed by (concatenated with)
-	 the Challenge Value. */
-      if (len < 16 + 2 || pkt->rep[1] != 16) {
-	log_err("Recv-Challenge: bad challenge reply length\n");
-	return -1;
-      }
-      s->success = 0;
-      if (s->user) {
-	unsigned char challenge[16];
-
-	MD5_Init (&md5_ctxt);
-	MD5_Update (&md5_ctxt, req + 1, 1); /* Identifier */
-	MD5_Update (&md5_ctxt, s->user->pass, strlen (s->user->pass));
-	MD5_Update (&md5_ctxt, s->challenge, sizeof s->challenge);
-	MD5_Final (challenge, &md5_ctxt);
-
-	if (memcmp (challenge, pkt->rep + 2, sizeof challenge) != 0)
-	  log_err("Recv-Challenge: failure due to mismatch\n");
-	else if (pkt->cur_time >= s->user->timeout)
-	  log_err("Recv-Challenge: failure due to timeout\n");
-	else
-	  s->success = 1;
+      if (len < 1 || pkt->rep[0] != s->proto_auth) {
+	if (len >= 1 && pkt->rep[0] == EAP_TYPE_NAK) {
+	  if (len == 1) {
+	    log_err("Recv-Challenge: nak and no auth protocol\n");
+	    return -1;
+	  }
+	  /* Try next protocol.  TODO: check if supported.  */
+	  if (s->proto_auth == EAP_TYPE_MS_CHAP_V2) {
+	    log_err("Recv-Challenge: nak and proto exhausted\n");
+	    return -1;
+	  }
+	  s->proto_auth = EAP_TYPE_MS_CHAP_V2;
+	  if (do_eap_peap_challenge(s) < 0)
+	    return -1;
+	}
+	else {
+	  log_err("Recv-Challenge: protocol error\n");
+	  return -1;
+	}
       }
       else {
-	log_err("Recv-Challenge: failure due to unknown user\n");
-      }
+	/* Check result.  */
+	int res;
 
-      /* Log */
-      {
-	static const char wday_name[12][4] = {
-	  "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
-	};
-	static const char mon_name[12][4] = {
-	  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-	  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
-	};
-	struct tm tm;
+	res = do_eap_peap_challenge_response(s, req, pkt->rep, len);
+	s->success = 0;
 
-	/* If the time is obviously wrong, don't try to convert it to
-	   local time.  */
-	if (pkt->cur_time > (time_t)(24 * 3600 * 365 * 20))
-	  localtime_r(&pkt->cur_time, &tm);
-	else
-	  gmtime_r(&pkt->cur_time, &tm);
+	if (res < 0)
+	  return -1;
+	else if (res == 0) {
+	  if (s->user)
+	    log_err("Recv-Challenge: failure due to mismatch\n");
+	  else
+	    log_err("Recv-Challenge: failure due to unknown user\n");
+	}
+	else {
+	  if (pkt->cur_time >= s->user->timeout)
+	    log_err("Recv-Challenge: failure due to timeout\n");
+	  else
+	    s->success = 1;
+	}
+
+	/* Log */
+	{
+	  static const char wday_name[12][4] = {
+	    "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
+	  };
+	  static const char mon_name[12][4] = {
+	    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+	    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+	  };
+	  struct tm tm;
+
+	  /* If the time is obviously wrong, don't try to convert it to
+	     local time.  */
+	  if (pkt->cur_time > (time_t)(24 * 3600 * 365 * 20))
+	    localtime_r(&pkt->cur_time, &tm);
+	  else
+	    gmtime_r(&pkt->cur_time, &tm);
 
 #if 0
-	asctime_r(&tm, tbuf);
+	  asctime_r(&tm, tbuf);
 
-	/* The output of asctime is a string of the form:
+	  /* The output of asctime is a string of the form:
 	     Thu Nov 24 18:22:48 1986\n\0
-	*/
-	assert(tbuf[26] == 0);
-	assert(tbuf[25] == '\n');
-	tbuf[25] = 0;
+	  */
+	  assert(tbuf[26] == 0);
+	  assert(tbuf[25] == '\n');
+	  tbuf[25] = 0;
 #endif
 
-	log_info("%s %s %2d %02d:%02d:%02d %d: user %s %s\n",
-		 wday_name[tm.tm_wday], mon_name[tm.tm_mon],
-		 tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
-		 1900 + tm.tm_year,
-		 s->user ? s->user->name : "(unknown)",
-		 s->success ? "accepted" : "rejected");
-      }
+	  log_info("%s %s %2d %02d:%02d:%02d %d: user %s %s\n",
+		   wday_name[tm.tm_wday], mon_name[tm.tm_mon],
+		   tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+		   1900 + tm.tm_year,
+		   s->user ? s->user->name : "(unknown)",
+		   s->success ? "accepted" : "rejected");
+	}
 
-      /* Result.  */
-      rsp[0] = EAP_CODE_REQUEST;
-      rsp[1] = 6;  /* id */
-      rsp[2] = 0;       /* len */
-      rsp[3] = sizeof rsp;
-      rsp[4] = EAP_TYPE_PEAP_EXTENSION;
-      write16(rsp + 5, EAP_ETYPE_RESULT);  /* Madatory AVP result */
-      rsp[7] = 0;    /* Length */
-      rsp[8] = 2;
-      rsp[9] = 0;  /* result */
-      rsp[10] = s->success ? RESULT_SUCCESS : RESULT_FAILURE;
-      if (flag_dump) {
-	dump_log ("SSL send result\n");
-	dump_eap_message(rsp, sizeof rsp);
+	/* Result.  */
+	rsp[0] = EAP_CODE_REQUEST;
+	rsp[1] = 6;  /* id */
+	rsp[2] = 0;       /* len */
+	rsp[3] = sizeof rsp;
+	rsp[4] = EAP_TYPE_PEAP_EXTENSION;
+	write16(rsp + 5, EAP_ETYPE_RESULT);  /* Madatory AVP result */
+	rsp[7] = 0;    /* Length */
+	rsp[8] = 2;
+	rsp[9] = 0;  /* result */
+	rsp[10] = s->success ? RESULT_SUCCESS : RESULT_FAILURE;
+	if (flag_dump) {
+	  dump_log ("SSL send result\n");
+	  dump_eap_message(rsp, sizeof rsp);
+	}
+	SSL_write (s->ssl, rsp, sizeof rsp);
+	s->state = S_TUN_RECV_RESULT;
       }
-      SSL_write (s->ssl, rsp, sizeof rsp);
-      s->state = S_TUN_RECV_RESULT;
     }
     break;
 
