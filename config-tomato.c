@@ -84,6 +84,7 @@ read_users_file (void)
     /* No change.  */
     return;
   }
+
   len = (unsigned)statb.st_size;
   buf = malloc (len + 1);
   if (buf == NULL) {
@@ -133,7 +134,7 @@ read_users_file (void)
     else
       log_err ("conf file: unknown user %s\n", u);
 
-    u = s;
+    u = e;
   }
   free (buf);
   return;
