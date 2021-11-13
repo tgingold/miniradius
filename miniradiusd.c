@@ -878,6 +878,8 @@ do_eap_peap_result_request(struct eap_ctxt *s)
       }
       write16 (rsp + 3, l - 1);
     }
+  default:
+    abort();
   }
 
   if (flag_dump) {

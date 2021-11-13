@@ -7,6 +7,11 @@
 #include "mschapv2.h"
 #include "dump.h"
 
+#ifdef OPENSSL_NO_MD4
+#include "md4.h"
+#include "md4.c"
+#endif
+
 static void
 des_encrypt(const unsigned char clear[8], const unsigned char *key,
 	    unsigned char res[8])
