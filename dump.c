@@ -53,8 +53,14 @@ dump_hex (const char *pfx, const unsigned char *p, unsigned len)
   unsigned i, j;
   for (i = 0; i < len; i += 16) {
     printf ("%s%04x:", pfx, i);
+    for (j = i; j < i + 16; j++)
+      if (j < len)
+	printf (" %02x", p[j]);
+      else
+	printf ("   ");
+    printf ("  ");
     for (j = i; j < len && j < i + 16; j++)
-      printf (" %02x", p[j]);
+      putchar(p[j] >= ' ' && p[j] < 127 ? p[j] : '.');
     putchar('\n');
   }
 }
