@@ -28,7 +28,7 @@ extern unsigned dump_eap_only;
 void dump_log(const char *fmt, ...);
 
 /* Read and dump pcap packets from stdin.  */
-int dump_pcap(void);
+int dump_pcap(unsigned port);
 
 /* Read and dump raw radius packets from stdin.  */
 int dump_packets(void);

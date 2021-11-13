@@ -650,7 +650,7 @@ dump_packets(void)
 }
 
 int
-dump_pcap(void)
+dump_pcap(unsigned port)
 {
   unsigned char buf[4096];
   int len;

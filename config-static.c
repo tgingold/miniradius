@@ -7,7 +7,7 @@
 
 #define NBR_USERS 2
 static struct user users[NBR_USERS] = {
-  { "tuser", "tpass" },
+  { "tuser", "tpass", (time_t)0x7fffffff },
   { "user2", "pass2" }
 };
 

@@ -36,6 +36,7 @@
 #include <openssl/des.h>
 
 #include "hmac_md5.h"
+#include "mschapv2.h"
 #include "radius.h"
 #include "config.h"
 #include "dump.h"
@@ -109,6 +110,7 @@ struct eap_ctxt {
   unsigned char proto_auth;
 
   unsigned char challenge[16];
+  unsigned char auth_string[20];  /* For ms-chap-v2 */
   unsigned char success;
   struct user *user;
 };
@@ -145,6 +147,21 @@ write32 (unsigned char *p, uint32_t v)
   p[1] = v >> 16;
   p[2] = v >> 8;
   p[3] = v >> 0;
+}
+
+/* Encode a string according to ms-chap-v2 */
+static void
+write_hex(unsigned char *p, const unsigned char *s, unsigned len)
+{
+  static const unsigned char hex[] = "0123456789ABCDEF";
+  unsigned i;
+  unsigned c;
+
+  for (i = 0; i < len; i++) {
+    c = s[i];
+    *p++ = hex[(c >> 4) & 0x0f];
+    *p++ = hex[(c >> 0) & 0x0f];
+  }
 }
 
 /* Check authenticator attribute.
@@ -350,6 +367,7 @@ do_eap_init(struct udp_pkt *pkt,
 
   /* Default: use md5-challenge. */
   ctxt->proto_auth = EAP_TYPE_MD5_CHALLENGE;
+  //ctxt->proto_auth = EAP_TYPE_MS_CHAP_V2;
 
   /* Prepare the response: start TLS.  */
   app_radius_hdr(pkt->rep, &off,
@@ -697,13 +715,14 @@ do_eap_peap_challenge(struct eap_ctxt *s)
       rsp[0] = EAP_TYPE_MS_CHAP_V2;
       rsp[1] = 1; /* Challenge */
       rsp[2] = s->last_id;
-      write16(rsp + 3, sizeof rsp);
+      write16(rsp + 3, sizeof rsp - 1);
       rsp[5] = sizeof s->challenge;  /* value size */
       RAND_bytes(s->challenge, sizeof s->challenge);
       memcpy (rsp + 6, s->challenge, sizeof s->challenge);  /* value */
       memcpy (rsp + 6 + sizeof s->challenge, "mr", 2);      /* name */
       if (flag_dump) {
 	dump_log ("SSL send ms-chap-v2 challenge\n");
+	dump_hex (" ", rsp, sizeof rsp);
 	dump_eap_response(rsp, sizeof rsp);
       }
       SSL_write (s->ssl, rsp, sizeof rsp);
@@ -714,28 +733,6 @@ do_eap_peap_challenge(struct eap_ctxt *s)
 	    s->proto_auth);
     return -1;
   }
-}
-
-static void
-des_encrypt(const unsigned char clear[8], const unsigned char *key,
-	    unsigned char res[8])
-{
-  unsigned char key64[8];
-  DES_key_schedule sched;
-
-  key64[0] = key[0] | 1;
-  key64[1] = (key[0] << 7) | (key[1] >> 1) | 1;
-  key64[2] = (key[1] << 6) | (key[2] >> 2) | 1;
-  key64[3] = (key[2] << 5) | (key[3] >> 3) | 1;
-  key64[4] = (key[3] << 4) | (key[4] >> 4) | 1;
-  key64[5] = (key[4] << 3) | (key[5] >> 5) | 1;
-  key64[6] = (key[5] << 2) | (key[6] >> 6) | 1;
-  key64[7] = (key[6] << 1) | 1;
-
-  DES_set_odd_parity(&key64);
-  DES_set_key(&key64, &sched);
-
-  DES_ecb_encrypt((DES_cblock *)clear, (DES_cblock *)res, &sched, DES_ENCRYPT);
 }
 
 /* Check response. -1: error, 0: reject, 1: ok */
@@ -786,40 +783,16 @@ do_eap_peap_challenge_response(struct eap_ctxt *s,
 	return -1;
       }
       if (s->user) {
-	SHA_CTX sha_ctx;
-	unsigned char chall_digest[8];
-	MD4_CTX md4_ctx;
-	unsigned char pass_digest[21];
-	unsigned char resp[24];
-	unsigned char unc[2];
-	const char *u;
+	const unsigned char *peer_challenge = rep + 6;
+	const char *user_name = s->user->name;
+	const char *pass = s->user->pass;
+	const unsigned char *challenge = s->challenge;
+	const unsigned char *expected_nt_resp = rep + 6 + 24;
 
-	/* RFC 2759 section 8. Pseudocode */
-	/* GenerateNTResponse */
-
-	/* ChallengeHash */
-	SHA1_Init(&sha_ctx);
-	SHA1_Update(&sha_ctx, rep + 6, 16);  /* Peer challenge */
-	SHA1_Update(&sha_ctx, s->challenge, 16); /* Auth challenge */
-	SHA1_Update(&sha_ctx, s->user->name, strlen(s->user->name));
-	SHA1_Final(chall_digest, &sha_ctx);
-
-	/* NtPasswordHash (password is in unicode) */
-	unc[1] = 0;
-	MD4_Init(&md4_ctx);
-	for (u = s->user->pass; *u; u++) {
-	  unc[0] = *u;
-	  MD4_Update(&md4_ctx, unc, 2);
-	}
-	MD4_Final(pass_digest, &md4_ctx);
-
-	/* ChallengeResponse */
-	memset(pass_digest + 16, 0, 5);
-	des_encrypt(chall_digest, pass_digest + 0, resp + 0);
-	des_encrypt(chall_digest, pass_digest + 7, resp + 8);
-	des_encrypt(chall_digest, pass_digest + 14, resp + 16);
-
-	return memcmp(resp, rep + 6 + 24, 24) == 0;
+	return mschapv2_ntresp (challenge, peer_challenge,
+				user_name, pass,
+				expected_nt_resp,
+				s->auth_string) == 0;
       }
       else {
 	return 0;
@@ -831,6 +804,88 @@ do_eap_peap_challenge_response(struct eap_ctxt *s,
 	    s->proto_auth);
     return -1;
   }
+}
+
+static void
+do_eap_peap_result_request(struct eap_ctxt *s)
+{
+  unsigned char rsp[64];
+  unsigned char l;
+  
+  switch (s->proto_auth) {
+  case EAP_TYPE_MD5_CHALLENGE:
+    {
+      /* Result.  See [MS-PEAP] */
+      /* EAP Packet */
+      rsp[0] = EAP_CODE_REQUEST;
+      rsp[1] = s->last_id + 1;  /* id */
+      rsp[2] = 0;       /* len */
+      rsp[4] = EAP_TYPE_PEAP_EXTENSION;
+      /* Result TLV */
+      write16(rsp + 5, EAP_ETYPE_RESULT);  /* Madatory AVP result */
+      rsp[7] = 0;    /* Length */
+      rsp[8] = 2;
+      rsp[9] = 0;  /* result */
+      rsp[10] = s->success ? RESULT_SUCCESS : RESULT_FAILURE;
+
+      l = 11;
+      rsp[3] = l;
+    }
+    break;
+  case EAP_TYPE_MS_CHAP_V2:
+    {
+      l = 0;
+#if 0
+      rsp[0] = EAP_CODE_REQUEST;
+      rsp[1] = s->last_id + 1;  /* id */
+      rsp[2] = 0;       /* len */
+      l = 3;
+#endif
+
+      if (s->success) {
+	rsp[l++] = EAP_TYPE_MS_CHAP_V2;
+	rsp[l++] = EAP_CODE_SUCCESS;
+	rsp[l++] = s->last_id + 1;
+	l += 2; /* 2 bytes for the length field. */
+	rsp[l++] = 'S';
+	rsp[l++] = '=';
+	write_hex(rsp + l, s->auth_string, sizeof (s->auth_string)); /* 20 */
+	l += 40;
+	rsp[l++] = ' ';
+	rsp[l++] = 'M';
+	rsp[l++] = '=';
+	rsp[l++] = 'O';
+	rsp[l++] = 'k';
+      }
+      else {
+	rsp[l++] = EAP_TYPE_MS_CHAP_V2;
+	rsp[l++] = EAP_CODE_FAILURE;
+	rsp[l++] = s->last_id + 1;
+	l += 2; /* 2 bytes for the length field. */
+	memcpy (rsp + l, "E=691 R=0 C=", 12);
+	l += 12;
+	write_hex(rsp + l, s->challenge, 16);
+	l += 32;
+	rsp[l++] = ' ';
+	rsp[l++] = 'V';
+	rsp[l++] = '=';
+	rsp[l++] = '3';
+	rsp[l++] = ' ';
+	rsp[l++] = 'M';
+	rsp[l++] = '=';
+	rsp[l++] = 'K';
+	rsp[l++] = 'O';
+      }
+      write16 (rsp + 3, l - 1);
+    }
+  }
+
+  if (flag_dump) {
+    dump_log ("SSL send result\n");
+    dump_hex(" ", rsp, l);
+    dump_eap_message(rsp, l);
+  }
+  SSL_write (s->ssl, rsp, l);
 }
 
 static int
@@ -866,7 +921,7 @@ do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
       }
     }
     if (flag_dump && len > 0) {
-      dump_log ("##SSL recv eap:\n");
+      dump_log ("##SSL recv eap (len=%u):\n", len);
       dump_hex ("  ", pkt->rep, len);
       dump_eap_response(pkt->rep, len);
     }
@@ -921,8 +976,6 @@ do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
     break;
   case S_TUN_RECV_CHALLENGE:
     {
-      unsigned char rsp[11];
-
       if (len < 1 || pkt->rep[0] != s->proto_auth) {
 	if (len >= 1 && pkt->rep[0] == EAP_TYPE_NAK) {
 	  if (len == 1) {
@@ -937,6 +990,7 @@ do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
 	  s->proto_auth = EAP_TYPE_MS_CHAP_V2;
 	  if (do_eap_peap_challenge(s) < 0)
 	    return -1;
+	  /* Else: send the packet */
 	}
 	else {
 	  log_err("Recv-Challenge: protocol error\n");
@@ -1002,22 +1056,8 @@ do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
 		   s->success ? "accepted" : "rejected");
 	}
 
-	/* Result.  */
-	rsp[0] = EAP_CODE_REQUEST;
-	rsp[1] = 6;  /* id */
-	rsp[2] = 0;       /* len */
-	rsp[3] = sizeof rsp;
-	rsp[4] = EAP_TYPE_PEAP_EXTENSION;
-	write16(rsp + 5, EAP_ETYPE_RESULT);  /* Madatory AVP result */
-	rsp[7] = 0;    /* Length */
-	rsp[8] = 2;
-	rsp[9] = 0;  /* result */
-	rsp[10] = s->success ? RESULT_SUCCESS : RESULT_FAILURE;
-	if (flag_dump) {
-	  dump_log ("SSL send result\n");
-	  dump_eap_message(rsp, sizeof rsp);
-	}
-	SSL_write (s->ssl, rsp, sizeof rsp);
+	do_eap_peap_result_request(s);
+
 	s->state = S_TUN_RECV_RESULT;
       }
     }
@@ -1033,19 +1073,42 @@ do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
       unsigned char key_mat[128];
       static const char label[] = "client EAP encryption"; /* RFC 5216 2.3 */
 
-      if (pkt->rep[0] != EAP_CODE_RESPONSE
-	  || len != 11
-	  // || pkt->rep[1] != 6 /* id */
-	  || read16(pkt->rep + 2) != 11 /* len */
-	  || pkt->rep[4] != EAP_TYPE_PEAP_EXTENSION
-	  || read16(pkt->rep + 5) != EAP_ETYPE_RESULT
-	  || read16(pkt->rep + 7) != 2) {
-	log_err("Recv-Result: non-result packet\n");
-	return -1;
-      }
-      if (read16(pkt->rep + 9) != eresult) {
-	log_err("Recv-Result: result mismatch!\n");
-	return -1;
+      switch (s->proto_auth) {
+      case EAP_TYPE_MD5_CHALLENGE:
+	{
+	  if (len != 11
+	      || pkt->rep[0] != EAP_CODE_RESPONSE
+	      // || pkt->rep[1] != 6 /* id */
+	      || read16(pkt->rep + 2) != 11 /* len */
+	      || pkt->rep[4] != EAP_TYPE_PEAP_EXTENSION
+	      || read16(pkt->rep + 5) != EAP_ETYPE_RESULT
+	      || read16(pkt->rep + 7) != 2) {
+	    log_err("Recv-Result: non-result packet\n");
+	    return -1;
+	  }
+	  if (read16(pkt->rep + 9) != eresult) {
+	    log_err("Recv-Result: result mismatch!\n");
+	    return -1;
+	  }
+	}
+	break;
+      case EAP_TYPE_MS_CHAP_V2:
+	if (s->success) {
+	  log_err("TODO: ms chap v2 success\n");
+	  return -1;
+	}
+	else {
+	  if (len != 2
+	      || pkt->rep[0] != EAP_TYPE_MS_CHAP_V2
+	      || pkt->rep[1] != 4 /* Failure */
+	      ) {
+	    log_err("Recv-Resulte: non-result packet\n");
+	    return -1;
+	  }
+	}
+	break;
+      default:
+	abort();
       }
 
       app_radius_hdr(pkt->rep, &off,
@@ -1437,7 +1500,7 @@ main (int argc, char *argv[])
   }
 
   if (flag_dump_pcap)
-    return dump_pcap();
+    return dump_pcap(port);
 
   if (secret == NULL) {
     fprintf (stderr, "%s: missing secret option (-s SECRET)\n", progname);
