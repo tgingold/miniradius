@@ -937,12 +937,14 @@ do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
 	if (0)
 	  dump_log ("Handshake accepted\n");
 
-	if (SSL_version(s->ssl) > TLS1_1_VERSION) {
+	if (0 && SSL_version(s->ssl) > TLS1_1_VERSION) {
+	  /* FIXME ? how to know if this is possible or not ?
+	     Re-send in case of ack ?  */
 	  do_eap_peap_ident(s);
 	  s->state = S_TUN_RECV_IDENTITY;
 	}
 	else {
-	  /* Some old clients won't accept data before an ack.  */
+	  /* Some clients won't accept data before an ack.  */
 	  s->state = S_TUN_SEND_IDENTITY;
 	}
       }
@@ -1340,9 +1342,12 @@ init_openssl(void)
   }
 
   SSL_CTX_set_ecdh_auto(ctx, 1);
-
   if (config_ssl(ctx) < 0)
     return NULL;
+
+  if (!SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION)) {
+    log_err("failed setting TLS max proto version\n");
+  }
 
   return ctx;
 }
