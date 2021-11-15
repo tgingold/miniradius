@@ -1004,6 +1004,7 @@ do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
       else {
 	/* Check result.  */
 	int res;
+	const char *err;
 
 	res = do_eap_peap_challenge_response(s, req, pkt->rep, len);
 	s->success = 0;
@@ -1012,15 +1013,17 @@ do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
 	  return -1;
 	else if (res == 0) {
 	  if (s->user)
-	    log_err("Recv-Challenge: failure due to mismatch\n");
+	    err = " (wrong password)";
 	  else
-	    log_err("Recv-Challenge: failure due to unknown user\n");
+	    err = " (unknown user)";
 	}
 	else {
 	  if (pkt->cur_time >= s->user->timeout)
-	    log_err("Recv-Challenge: failure due to timeout\n");
-	  else
+	    err = " (timeout)";
+	  else {
+	    err = "";
 	    s->success = 1;
+	  }
 	}
 
 	/* Log */
@@ -1052,12 +1055,13 @@ do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
 	  tbuf[25] = 0;
 #endif
 
-	  log_info("%s %s %2d %02d:%02d:%02d %d: user %s %s\n",
+	  log_info("%s %s %2d %02d:%02d:%02d %d: user %s %s%s\n",
 		   wday_name[tm.tm_wday], mon_name[tm.tm_mon],
 		   tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
 		   1900 + tm.tm_year,
 		   s->user ? s->user->name : "(unknown)",
-		   s->success ? "accepted" : "rejected");
+		   s->success ? "accepted" : "rejected",
+		   err);
 	}
 
 	do_eap_peap_result_request(s);
