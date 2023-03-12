@@ -714,8 +714,8 @@ do_eap_peap_challenge(struct eap_ctxt *s)
       /* Send Challenge. draft-kamath-pppext-eap-mschapv2-02 */
       rsp[0] = EAP_TYPE_MS_CHAP_V2;
       rsp[1] = 1; /* Challenge */
-      rsp[2] = s->last_id;
-      write16(rsp + 3, sizeof rsp - 1);
+      rsp[2] = s->last_id; /* id */
+      write16(rsp + 3, sizeof rsp - 1); /* len */
       rsp[5] = sizeof s->challenge;  /* value size */
       RAND_bytes(s->challenge, sizeof s->challenge);
       memcpy (rsp + 6, s->challenge, sizeof s->challenge);  /* value */
@@ -878,7 +878,9 @@ do_eap_peap_result_request(struct eap_ctxt *s)
       }
       write16 (rsp + 3, l - 1);
     }
+    break;
   default:
+    log_err("eap peap result request: unhandled auth %u\n", s->proto_auth);
     abort();
   }
 
@@ -1110,12 +1112,13 @@ do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
 	      || pkt->rep[0] != EAP_TYPE_MS_CHAP_V2
 	      || pkt->rep[1] != 4 /* Failure */
 	      ) {
-	    log_err("Recv-Resulte: non-result packet\n");
+	    log_err("Recv-Result: non-result packet\n");
 	    return -1;
 	  }
 	}
 	break;
       default:
+	log_err("Recv tunnel proto: unhandled auth %u\n", s->proto_auth);
 	abort();
       }
 
@@ -1273,7 +1276,7 @@ handle_access_request(struct udp_pkt *pkt)
     int auth;
 
     if (flag_dump) {
-      dump_log ("EAP message(concat) len=%u:\n", eap_len);
+      dump_log ("EAP message(full) len=%u:\n", eap_len);
       dump_eap_message(eap_buf, eap_len);
     }
 

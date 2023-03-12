@@ -620,7 +620,7 @@ dump_radius (const unsigned char *p, unsigned plen)
   }
 
   if (eap_len != 0) {
-    printf ("EAP message:\n");
+    printf ("EAP message (reconstructed):\n");
     dump_eap_message(eap_buf, eap_len);
   }
 }
