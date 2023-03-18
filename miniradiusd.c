@@ -788,11 +788,15 @@ do_eap_peap_challenge_response(struct eap_ctxt *s,
 	const char *pass = s->user->pass;
 	const unsigned char *challenge = s->challenge;
 	const unsigned char *expected_nt_resp = rep + 6 + 24;
+	int res;
 
-	return mschapv2_ntresp (challenge, peer_challenge,
-				user_name, pass,
-				expected_nt_resp,
-				s->auth_string) == 0;
+	res = mschapv2_ntresp (challenge, peer_challenge,
+			       user_name, pass,
+			       expected_nt_resp,
+			       s->auth_string);
+	if (flag_dump)
+	  dump_log("ms-chap-v2 nt-resp: %d\n", res);
+	return res == 0;
       }
       else {
 	return 0;
@@ -1104,15 +1108,20 @@ do_eap_peap(struct udp_pkt *pkt, struct eap_ctxt *s,
 	break;
       case EAP_TYPE_MS_CHAP_V2:
 	if (s->success) {
-	  log_err("TODO: ms chap v2 success\n");
-	  return -1;
+	  if (len != 2
+	      || pkt->rep[0] != EAP_TYPE_MS_CHAP_V2
+	      || pkt->rep[1] != 3 /* Success */
+	      ) {
+	    log_err("Recv-Result: non-success packet\n");
+	    return -1;
+	  }
 	}
 	else {
 	  if (len != 2
 	      || pkt->rep[0] != EAP_TYPE_MS_CHAP_V2
 	      || pkt->rep[1] != 4 /* Failure */
 	      ) {
-	    log_err("Recv-Result: non-result packet\n");
+	    log_err("Recv-Result: non-failure packet\n");
 	    return -1;
 	  }
 	}
